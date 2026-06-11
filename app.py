@@ -9,9 +9,11 @@ import csv
 import io
 import os
 import re
+from datetime import datetime, timezone
 from io import StringIO
 from typing import Optional
 
+import requests as _requests
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -27,9 +29,35 @@ from utils import (
 
 load_dotenv()
 
+ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL", "")
+
 CHANNEL_ORDER = ("Just Eat", "Deliveroo", "Uber Eats")
 DEFAULT_WORKERS = 20
 PREVIEW_ROWS = 100
+
+
+def _track_page(page_name: str):
+    """Fire-and-forget POST to Zapier with the page the user visited."""
+    if not ZAPIER_WEBHOOK_URL:
+        return
+    try:
+        _requests.post(
+            ZAPIER_WEBHOOK_URL,
+            json={
+                "page": page_name,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _track_hours_page(page: str) -> None:
+    page_name = "OS Export" if page == "Export" else "OS Import"
+    if st.session_state.get("hours_page_tracked") != page:
+        _track_page(page_name)
+        st.session_state["hours_page_tracked"] = page
 
 
 def _parse_location_ids(raw: str) -> list:
@@ -81,6 +109,25 @@ def _export_csv_filename(account_id: str, channel_label: str) -> str:
 def _opening_hours_export_filename(account_id: str) -> str:
     short_acc = re.sub(r"[^\w]", "", account_id)[:12] or "account"
     return f"opening_hours_{short_acc}.csv"
+
+
+def _import_preview_row(detail: dict) -> dict:
+    status_labels = {
+        "full": "Ready (7/7)",
+        "partial": "Partial",
+        "skipped_no_id": "No channel link ID",
+        "skipped_no_hours": "No opening hours",
+        "skipped_invalid": "Invalid hours",
+    }
+    return {
+        "Location": detail.get("locationName", ""),
+        "Channel": detail.get("channelLinkName", ""),
+        "Channel link ID": detail.get("channelLinkId", ""),
+        "Days": f"{detail.get('day_count', 0)}/7",
+        "Closed days": ", ".join(detail.get("missing_days") or []) or "—",
+        "Invalid days": ", ".join(detail.get("invalid_days") or []) or "—",
+        "Status": status_labels.get(detail.get("status", ""), detail.get("status", "")),
+    }
 
 
 def _count_rows_with_full_hours(rows: list) -> int:
@@ -267,7 +314,8 @@ def _render_opening_hours_import(account_id: str) -> None:
     st.subheader("Import from CSV")
     st.markdown(
         "Upload the same CSV format produced by export. "
-        "Only rows with a `channelLinkId` and **all seven** day columns filled are updated."
+        "Rows need a `channelLinkId` and at least one valid day. "
+        "Closed or blank days are omitted from the import payload."
     )
 
     uploaded = st.file_uploader(
@@ -296,22 +344,41 @@ def _render_opening_hours_import(account_id: str) -> None:
 
     if "hours_import_summary" in st.session_state:
         summary = st.session_state["hours_import_summary"]
+        row_details = summary.get("row_details", [])
+        preview_rows = [_import_preview_row(d) for d in row_details]
+        partial_rows = [r for r in preview_rows if r["Status"] == "Partial"]
+        invalid_rows = [r for r in preview_rows if r["Status"] == "Invalid hours"]
+
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total rows", summary["total_rows"])
         c2.metric("Ready to import", summary["importable"])
-        c3.metric("Skipped (no ID)", summary["skipped_no_id"])
-        c4.metric("Skipped (incomplete days)", summary["skipped_incomplete"])
+        c3.metric("Partial (closed days)", summary.get("partial", 0))
+        c4.metric("Skipped", summary["skipped_no_id"] + summary.get("skipped_no_hours", 0) + summary.get("skipped_invalid", 0))
+
+        if partial_rows:
+            st.warning(
+                f"{len(partial_rows)} row(s) have closed days. "
+                "Those days will be left out of the opening hours payload."
+            )
+            st.dataframe(partial_rows, use_container_width=True, hide_index=True)
+
+        if invalid_rows:
+            st.error(
+                f"{len(invalid_rows)} row(s) have invalid hour values. "
+                "Fix these before importing."
+            )
+            st.dataframe(invalid_rows, use_container_width=True, hide_index=True)
 
         with st.expander(f"Preview (first {PREVIEW_ROWS} rows)", expanded=False):
             st.dataframe(
-                st.session_state["hours_import_rows"][:PREVIEW_ROWS],
+                preview_rows[:PREVIEW_ROWS],
                 use_container_width=True,
                 hide_index=True,
             )
 
         if summary["importable"] == 0:
             st.warning(
-                "No rows are ready to import. Each row needs a channelLinkId and hours for all 7 days."
+                "No rows are ready to import. Each row needs a channelLinkId and at least one valid day."
             )
         elif st.button("Import opening hours", type="primary", key="hours_import_btn"):
             if not account_id.strip():
@@ -379,8 +446,16 @@ with st.sidebar:
         key="account_id_input",
     )
 
-hours_export_tab, hours_import_tab = st.tabs(["Export", "Import"])
-with hours_export_tab:
+hours_page = st.radio(
+    "Section",
+    ["Export", "Import"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="hours_page",
+)
+_track_hours_page(hours_page)
+
+if hours_page == "Export":
     _render_opening_hours_export(account_id)
-with hours_import_tab:
+else:
     _render_opening_hours_import(account_id)

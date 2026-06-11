@@ -358,6 +358,46 @@ def opening_hours_from_csv_row(row: dict) -> list:
     return out
 
 
+def inspect_opening_hours_row(row: dict) -> dict:
+    """Classify a CSV row for import preview and payload building."""
+    channel_link_id = (row.get("channelLinkId") or "").strip()
+    hours = opening_hours_from_csv_row(row)
+    missing_days = []
+    invalid_days = []
+
+    for col in OPENING_HOURS_DAY_COLUMNS:
+        cell = row.get(col)
+        s = str(cell).strip() if cell is not None else ""
+        if not s or s.lower() in ("closed", "n/a", "-", "—"):
+            missing_days.append(col)
+            continue
+        start, end = parse_opening_hours_day_cell(cell)
+        if start is None or end is None:
+            invalid_days.append(col)
+
+    day_count = len(hours)
+    if not channel_link_id:
+        status = "skipped_no_id"
+    elif invalid_days:
+        status = "skipped_invalid"
+    elif day_count == 0:
+        status = "skipped_no_hours"
+    elif day_count < 7:
+        status = "partial"
+    else:
+        status = "full"
+
+    return {
+        "channelLinkId": channel_link_id,
+        "hours": hours,
+        "day_count": day_count,
+        "missing_days": missing_days,
+        "invalid_days": invalid_days,
+        "status": status,
+        "importable": status in ("partial", "full"),
+    }
+
+
 def _validate_opening_hours_csv_columns(rows: list) -> None:
     if not rows:
         raise ValueError("CSV is empty")
@@ -371,13 +411,12 @@ def load_opening_hours_import_payloads_from_rows(rows: list) -> list:
 
     payloads = []
     for row in rows:
-        channel_link_id = (row.get("channelLinkId") or "").strip()
-        if not channel_link_id:
+        info = inspect_opening_hours_row(row)
+        if not info["importable"]:
             continue
-        hours = opening_hours_from_csv_row(row)
-        if len(hours) != 7:
-            continue
-        payloads.append({"channelLinkId": channel_link_id, "openingHours": hours})
+        payloads.append(
+            {"channelLinkId": info["channelLinkId"], "openingHours": info["hours"]}
+        )
     return payloads
 
 
@@ -396,25 +435,46 @@ def analyze_opening_hours_csv_rows(rows: list) -> dict:
     """Summarize how many CSV rows can be imported vs skipped."""
     _validate_opening_hours_csv_columns(rows)
 
-    skipped_no_id = 0
-    skipped_incomplete = 0
     importable = 0
+    full_week = 0
+    partial = 0
+    skipped_no_id = 0
+    skipped_no_hours = 0
+    skipped_invalid = 0
+    row_details = []
+
     for row in rows:
-        channel_link_id = (row.get("channelLinkId") or "").strip()
-        if not channel_link_id:
+        info = inspect_opening_hours_row(row)
+        row_details.append(
+            {
+                **info,
+                "locationName": row.get("locationName", ""),
+                "channelLinkName": row.get("channelLinkName", ""),
+            }
+        )
+        status = info["status"]
+        if status == "skipped_no_id":
             skipped_no_id += 1
-            continue
-        hours = opening_hours_from_csv_row(row)
-        if len(hours) != 7:
-            skipped_incomplete += 1
-            continue
-        importable += 1
+        elif status == "skipped_invalid":
+            skipped_invalid += 1
+        elif status == "skipped_no_hours":
+            skipped_no_hours += 1
+        elif status == "partial":
+            partial += 1
+            importable += 1
+        elif status == "full":
+            full_week += 1
+            importable += 1
 
     return {
         "total_rows": len(rows),
         "importable": importable,
+        "full_week": full_week,
+        "partial": partial,
         "skipped_no_id": skipped_no_id,
-        "skipped_incomplete": skipped_incomplete,
+        "skipped_no_hours": skipped_no_hours,
+        "skipped_invalid": skipped_invalid,
+        "row_details": row_details,
     }
 
 
