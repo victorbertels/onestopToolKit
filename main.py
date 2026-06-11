@@ -10,6 +10,8 @@ from utils import (
     checkIfRetailOrderAutoAcceptEnabled,
     updateLocation,
     groupResultsByChannel,
+    updateChannelLink,
+    getChannelLink,
 )
 from retail_channels_payload import justEatPayload, deliverooPayload, uberEatsPayload
 
@@ -42,7 +44,8 @@ def createRetailChannels(
         if not checkIfRetailOrderAutoAcceptEnabled(location):
             log(f"Updating `{location_name}` to enable auto-accept retail orders")
             location_payload = {"posSettings": {"generic": {"autoAcceptRetailOrder": True}}}
-            updateLocation(location_id, location_payload, location.get("_etag"))
+            up = updateLocation(location_id, location_payload, location.get("_etag"))
+            print(up)
 
         created_information[location_name] = {}
         created_information[location_name]["justEatRetail"] = createRetailChannel(
@@ -58,14 +61,3 @@ def createRetailChannels(
     grouped_information = groupResultsByChannel(created_information)
     return grouped_information
 
-
-if __name__ == "__main__":
-    load_dotenv()
-    # Example CLI usage — set `ACCOUNT_ID` in `.env` or edit below.
-    _account = (os.getenv("ACCOUNT_ID") or "").strip() or "6963884edc8e7760066fa547"
-    _locations = [
-        "6970b84f39cf45ffda504c46",
-        "6970c33dbe723e0d5286010e",
-    ]
-    out = createRetailChannels(_account, _locations, progress_callback=print)
-    print(out)

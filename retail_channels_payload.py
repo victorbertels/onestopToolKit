@@ -9,13 +9,12 @@ justEatPayload = {
     {
         "channelAppendsDiscountedItems": True,
         "needsChannelValidation": True,
-        "sendUnitPricing": True,
         "useNewPromotions": False,
         "useUpdateOrderItemsFlow": False,
         "insertPosOrderAfterDmaAccept": False,
         "addManagementFee": False,
         "autoAcceptOrderStatus": 20,
-        "sendToQuest": False,
+        "sendToQuest": True,
         "useChannelItemNames": False,
         "logChannelOperations": True,
         "sendRejectStatus": False,
@@ -103,7 +102,7 @@ justEatPayload = {
     "paymentProfile": "",
     "menuUrl": "",
     "status": 3,
-    "name": "Just Eat - Retail",
+    "name": "Just Eat",
     "channel": 6009,
     "priceLevelSettings":
     {},
@@ -220,7 +219,7 @@ deliverooPayload = {
     "paymentProfile": "",
     "menuUrl": "",
     "status": 3,
-    "name": "Deliveroo - Retail",
+    "name": "Deliveroo",
     "channel": 6002,
     "priceLevelSettings":
     {},
@@ -286,7 +285,7 @@ uberEatsPayload = {
         "catalogSFTPPushProd": True,
         "catalogSFTPConnectionConfigKey": "uber_eats_uk",
         "catalogPushEnabled": True,
-        "application": "FLOOID",
+        "application": "RETAIL_FLOOID",
         "provisioning": 0
     },
     "posSettings":
@@ -351,7 +350,7 @@ uberEatsPayload = {
     "paymentProfile": "",
     "menuUrl": "",
     "status": 3,
-    "name": "Uber Eats - Retail",
+    "name": "Uber Eats",
     "channel": 6007,
     "priceLevelSettings":
     {},
