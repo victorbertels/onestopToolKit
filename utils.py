@@ -3,6 +3,7 @@ import sys
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+import copy
 import csv
 import io
 import json
@@ -139,11 +140,12 @@ def createRetailChannel(location: dict ,channelPayload: dict):
     locationId = location.get("_id")
     accountId = location.get("account")
     locationPosSettings = location.get("posSettings")
-    channelPayload['posSettings'] = locationPosSettings
-    channelPayload['location'] = locationId
-    channelPayload['account'] = accountId
+    payload = copy.deepcopy(channelPayload)
+    payload['posSettings'] = locationPosSettings
+    payload['location'] = locationId
+    payload['account'] = accountId
     url = f"https://api.deliverect.io/channelLinks"
-    response = requests.post(url, headers=getHeaders(), json=channelPayload)
+    response = requests.post(url, headers=getHeaders(), json=payload)
     if not _http_ok(response):
         return False
     return response.json().get("_id")

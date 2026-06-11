@@ -51,8 +51,3 @@ def getToken():
 def getHeaders():
     """Get headers with a fresh token"""
     return {"Authorization": f"Bearer {getToken()}"}
-
-
-headers = getHeaders()
-
-# print(headers)

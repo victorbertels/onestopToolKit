@@ -1,6 +1,12 @@
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
 justEatPayload = {
-    "location": "6970b84f39cf45ffda504c46",
-    "account": "6963884edc8e7760066fa547",
+    "location": "",
+    "account": "",
     "posSystemId": 10123,
     "taxExcl": False,
     "timezone": "Europe/London",
@@ -35,7 +41,7 @@ justEatPayload = {
         "isMenuPushRestricted": False,
         "brandSlug": "",
         "alcoholMenuEnabled": False,
-        "APIkey": "hdgskcbqRsxKHwKBiGPFnTHzqNaTDdBXBmhjr",
+        "APIkey": os.getenv("JUST_EAT_API_KEY", ""),
         "application": "PRODUCTION",
         "locReference": "",
         "restaurantId": ""
@@ -44,8 +50,8 @@ justEatPayload = {
     {
         "generic":
         {
-            "locationId": "6208",
-            "ordersWebhookURL": "https://deliverect.a.osuk.gcp.flooidcloudhosting.com/omniorch/v1/submit/deliverect?apikey=aa83cee405fe4e86b71b",
+            "locationId": "",
+            "ordersWebhookURL": "",
             "syncTablesURL": "",
             "syncFloorsURL": "",
             "syncBillsURL": "",
@@ -55,7 +61,7 @@ justEatPayload = {
             "productPushWebhookURL": "",
             "taxCalculationWebhookURL": "",
             "customHeaders": "",
-            "syncProductsURL": "https://deliverect.a.osuk.gcp.flooidcloudhosting.com/omniorch/v1/sync?Channel=DELIVERECT&storeCode=6208&companyCode=OS01&apikey=aa83cee405fe4e86b71b&deliverectLocation=6208%20-%20LEICESTER%20EVINGTON%20ROAD%20-%20ENG",
+            "syncProductsURL": "",
             "productSyncType": 1,
             "defaultDeliveryTax": "",
             "defaultTakeawayTax": "",
@@ -119,8 +125,8 @@ justEatPayload = {
 
 
 deliverooPayload = {
-    "location": "6970b84f39cf45ffda504c46",
-    "account": "6963884edc8e7760066fa547",
+    "location": "",
+    "account": "",
     "posSystemId": 10123,
     "taxExcl": False,
     "timezone": "Europe/London",
@@ -161,8 +167,8 @@ deliverooPayload = {
     {
         "generic":
         {
-            "locationId": "6208",
-            "ordersWebhookURL": "https://deliverect.a.osuk.gcp.flooidcloudhosting.com/omniorch/v1/submit/deliverect?apikey=aa83cee405fe4e86b71b",
+            "locationId": "",
+            "ordersWebhookURL": "",
             "syncTablesURL": "",
             "syncFloorsURL": "",
             "syncBillsURL": "",
@@ -172,7 +178,7 @@ deliverooPayload = {
             "productPushWebhookURL": "",
             "taxCalculationWebhookURL": "",
             "customHeaders": "",
-            "syncProductsURL": "https://deliverect.a.osuk.gcp.flooidcloudhosting.com/omniorch/v1/sync?Channel=DELIVERECT&storeCode=6208&companyCode=OS01&apikey=aa83cee405fe4e86b71b&deliverectLocation=6208%20-%20LEICESTER%20EVINGTON%20ROAD%20-%20ENG",
+            "syncProductsURL": "",
             "productSyncType": 1,
             "defaultDeliveryTax": "",
             "defaultTakeawayTax": "",
@@ -234,8 +240,8 @@ deliverooPayload = {
 
 
 uberEatsPayload = {
-    "location": "6970b84f39cf45ffda504c46",
-    "account": "6963884edc8e7760066fa547",
+    "location": "",
+    "account": "",
     "posSystemId": 10123,
     "taxExcl": False,
     "timezone": "Europe/London",
@@ -292,8 +298,8 @@ uberEatsPayload = {
     {
         "generic":
         {
-            "locationId": "6208",
-            "ordersWebhookURL": "https://deliverect.a.osuk.gcp.flooidcloudhosting.com/omniorch/v1/submit/deliverect?apikey=aa83cee405fe4e86b71b",
+            "locationId": "",
+            "ordersWebhookURL": "",
             "syncTablesURL": "",
             "syncFloorsURL": "",
             "syncBillsURL": "",
@@ -303,7 +309,7 @@ uberEatsPayload = {
             "productPushWebhookURL": "",
             "taxCalculationWebhookURL": "",
             "customHeaders": "",
-            "syncProductsURL": "https://deliverect.a.osuk.gcp.flooidcloudhosting.com/omniorch/v1/sync?Channel=DELIVERECT&storeCode=6208&companyCode=OS01&apikey=aa83cee405fe4e86b71b&deliverectLocation=6208%20-%20LEICESTER%20EVINGTON%20ROAD%20-%20ENG",
+            "syncProductsURL": "",
             "productSyncType": 1,
             "defaultDeliveryTax": "",
             "defaultTakeawayTax": "",

@@ -30,7 +30,6 @@ load_dotenv()
 CHANNEL_ORDER = ("Just Eat", "Deliveroo", "Uber Eats")
 DEFAULT_WORKERS = 20
 PREVIEW_ROWS = 100
-DEFAULT_ACCOUNT_ID = "6963884edc8e7760066fa547"
 
 
 def _parse_location_ids(raw: str) -> list:
@@ -366,18 +365,16 @@ st.caption(
 )
 
 if "account_id_input" not in st.session_state:
-    st.session_state.account_id_input = (
-        os.getenv("ACCOUNT_ID") or DEFAULT_ACCOUNT_ID
-    ).strip()
+    st.session_state.account_id_input = (os.getenv("ACCOUNT_ID") or "").strip()
 
 with st.sidebar:
     st.header("Account")
     account_id = st.text_input(
         "Account ID",
-        placeholder=DEFAULT_ACCOUNT_ID,
+        placeholder="Deliverect account _id",
         help=(
             "Deliverect account `_id`. "
-            "You can set a default in `.env` as `ACCOUNT_ID=...` and override here when needed."
+            "Set a default in `.env` as `ACCOUNT_ID=...` or enter it here."
         ),
         key="account_id_input",
     )
