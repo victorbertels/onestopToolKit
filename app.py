@@ -9,6 +9,7 @@ import csv
 import io
 import os
 import re
+import secrets
 from datetime import datetime, timezone
 from io import StringIO
 from typing import Optional
@@ -30,6 +31,7 @@ from utils import (
 load_dotenv()
 
 ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL", "")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
 CHANNEL_ORDER = ("Just Eat", "Deliveroo", "Uber Eats")
 DEFAULT_WORKERS = 20
@@ -58,6 +60,29 @@ def _track_hours_page(page: str) -> None:
     if st.session_state.get("hours_page_tracked") != page:
         _track_page(page_name)
         st.session_state["hours_page_tracked"] = page
+
+
+def _require_password() -> None:
+    if st.session_state.get("authenticated"):
+        return
+
+    st.title("Onestop Toolkit")
+    st.caption("Enter the password to continue.")
+
+    if not APP_PASSWORD:
+        st.error("APP_PASSWORD is not configured. Set it in the environment or vault.")
+        st.stop()
+
+    with st.form("login", clear_on_submit=False):
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary")
+        if submitted:
+            if secrets.compare_digest(password, APP_PASSWORD):
+                st.session_state["authenticated"] = True
+                st.rerun()
+            st.error("Incorrect password.")
+
+    st.stop()
 
 
 def _parse_location_ids(raw: str) -> list:
@@ -424,6 +449,8 @@ def _render_opening_hours_import(account_id: str) -> None:
 
 
 st.set_page_config(page_title="Onestop Toolkit", layout="wide")
+_require_password()
+
 st.title("Opening hours")
 st.caption(
     "Export channel link opening hours to CSV, edit in Excel, then import back using the same format. "
@@ -433,6 +460,10 @@ if "account_id_input" not in st.session_state:
     st.session_state.account_id_input = (os.getenv("ACCOUNT_ID") or "").strip()
 
 with st.sidebar:
+    if st.button("Sign out", key="sign_out"):
+        st.session_state.pop("authenticated", None)
+        st.session_state.pop("hours_page_tracked", None)
+        st.rerun()
     st.header("Account")
     account_id = st.text_input(
         "Account ID",
