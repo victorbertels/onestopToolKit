@@ -427,8 +427,6 @@ st.set_page_config(page_title="Onestop Toolkit", layout="wide")
 st.title("Opening hours")
 st.caption(
     "Export channel link opening hours to CSV, edit in Excel, then import back using the same format. "
-    "API credentials and optional default account come from `.env` "
-    "(`CLIENT_ID`, `CLIENT_SECRET`, `ACCOUNT_ID`)."
 )
 
 if "account_id_input" not in st.session_state:
