@@ -156,6 +156,7 @@ def _render_channel_activation_emails(account_id: str) -> None:
             st.session_state["activation_grouped"] = grouped
             st.session_state["activation_cohort"] = cohort_tag.strip()
             total = sum(len(grouped.get(p) or []) for p in PARTNER_ORDER)
+            _track_page("OS Generate Emails")
             st.success(f"Generated emails for {total} channel link(s) in tag “{cohort_tag.strip()}”.")
             st.rerun()
 
