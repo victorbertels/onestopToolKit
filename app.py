@@ -562,10 +562,9 @@ def _get_account_id() -> str:
     return (os.getenv("ACCOUNT_ID") or "").strip()
 
 
-def _sign_out_footer() -> None:
-    st.divider()
-    _, col, _ = st.columns([2, 1, 2])
-    with col:
+def _sign_out_sidebar() -> None:
+    with st.sidebar:
+        st.divider()
         if st.button("Sign out", key="sign_out", use_container_width=True):
             st.session_state.pop("authenticated", None)
             st.session_state.pop("hours_page_tracked", None)
@@ -580,7 +579,6 @@ def page_opening_hours_export() -> None:
     )
     _track_hours_page("Export")
     _render_opening_hours_export(_get_account_id())
-    _sign_out_footer()
 
 
 def page_opening_hours_import() -> None:
@@ -590,7 +588,6 @@ def page_opening_hours_import() -> None:
     )
     _track_hours_page("Import")
     _render_opening_hours_import(_get_account_id())
-    _sign_out_footer()
 
 
 def page_channel_activation() -> None:
@@ -600,7 +597,6 @@ def page_channel_activation() -> None:
     st.title("Channel activation emails")
     st.caption("Generate partner emails with store lists and channel link IDs.")
     _render_channel_activation_emails(_get_account_id())
-    _sign_out_footer()
 
 
 st.set_page_config(
@@ -609,6 +605,27 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 _require_password()
+
+st.markdown(
+    """
+    <style>
+    section[data-testid="stSidebar"] > div:first-child {
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] > div:last-child {
+        margin-top: auto !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 pages = {
     "Opening hours": [
@@ -622,3 +639,4 @@ pages = {
 
 pg = st.navigation(pages, position="sidebar")
 pg.run()
+_sign_out_sidebar()
