@@ -92,16 +92,7 @@ def _require_password() -> None:
     st.stop()
 
 
-def _track_tool_page(tool: str) -> None:
-    if tool == "Opening hours":
-        return
-    if st.session_state.get("tool_page_tracked") != tool:
-        _track_page("OS Channel Activation")
-        st.session_state["tool_page_tracked"] = tool
-
-
 def _render_channel_activation_emails(account_id: str) -> None:
-    st.subheader("Channel activation emails")
     st.markdown(
         "Build partner-specific emails for **Uber Eats**, **Deliveroo**, and **Just Eat** "
         "using locations filtered by tag. Each email lists the stores and IDs the partner "
@@ -567,20 +558,57 @@ def _render_opening_hours_import(account_id: str) -> None:
                     st.success(f"Imported opening hours for {ok} channel link(s).")
 
 
-st.set_page_config(page_title="Onestop Toolkit", layout="wide")
+def _get_account_id() -> str:
+    return (st.session_state.get("account_id_input") or "").strip()
+
+
+def page_opening_hours_export() -> None:
+    st.title("Opening hours")
+    st.caption(
+        "Export channel link opening hours to CSV, edit in Excel, then import back using the same format."
+    )
+    _track_hours_page("Export")
+    _render_opening_hours_export(_get_account_id())
+
+
+def page_opening_hours_import() -> None:
+    st.title("Opening hours")
+    st.caption(
+        "Export channel link opening hours to CSV, edit in Excel, then import back using the same format."
+    )
+    _track_hours_page("Import")
+    _render_opening_hours_import(_get_account_id())
+
+
+def page_channel_activation() -> None:
+    if st.session_state.get("tool_page_tracked") != "Channel activation emails":
+        _track_page("OS Channel Activation")
+        st.session_state["tool_page_tracked"] = "Channel activation emails"
+    st.title("Channel activation emails")
+    st.caption("Generate partner emails with store lists and channel link IDs.")
+    _render_channel_activation_emails(_get_account_id())
+
+
+st.set_page_config(
+    page_title="Onestop Toolkit",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 _require_password()
 
 if "account_id_input" not in st.session_state:
     st.session_state.account_id_input = (os.getenv("ACCOUNT_ID") or "").strip()
 
 with st.sidebar:
-    if st.button("Sign out", key="sign_out"):
+    st.markdown("### Onestop Toolkit")
+    if st.button("Sign out", key="sign_out", use_container_width=True):
         st.session_state.pop("authenticated", None)
         st.session_state.pop("hours_page_tracked", None)
         st.session_state.pop("tool_page_tracked", None)
         st.rerun()
+    st.divider()
     st.header("Account")
-    account_id = st.text_input(
+    st.text_input(
         "Account ID",
         placeholder="Deliverect account _id",
         help=(
@@ -590,33 +618,15 @@ with st.sidebar:
         key="account_id_input",
     )
 
-tool = st.radio(
-    "Tool",
-    ["Opening hours", "Channel activation emails"],
-    horizontal=True,
-    label_visibility="collapsed",
-    key="app_tool",
-)
-_track_tool_page(tool)
+pages = {
+    "Opening hours": [
+        st.Page(page_opening_hours_export, title="Export", icon=":material/upload:"),
+        st.Page(page_opening_hours_import, title="Import", icon=":material/download:"),
+    ],
+    "Partner emails": [
+        st.Page(page_channel_activation, title="Channel activation", icon=":material/mail:"),
+    ],
+}
 
-if tool == "Opening hours":
-    st.title("Opening hours")
-    st.caption(
-        "Export channel link opening hours to CSV, edit in Excel, then import back using the same format."
-    )
-    hours_page = st.radio(
-        "Section",
-        ["Export", "Import"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="hours_page",
-    )
-    _track_hours_page(hours_page)
-    if hours_page == "Export":
-        _render_opening_hours_export(account_id)
-    else:
-        _render_opening_hours_import(account_id)
-else:
-    st.title("Channel activation emails")
-    st.caption("Generate partner emails with store lists and channel link IDs.")
-    _render_channel_activation_emails(account_id)
+pg = st.navigation(pages, position="sidebar")
+pg.run()
