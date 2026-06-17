@@ -109,7 +109,7 @@ def _render_channel_activation_emails(account_id: str) -> None:
     load_tags = st.button("Load location tags", key="activation_load_tags")
     if load_tags:
         if not account_id.strip():
-            st.error("Enter an account ID.")
+            st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
         else:
             with st.spinner("Fetching locations…"):
                 try:
@@ -135,7 +135,7 @@ def _render_channel_activation_emails(account_id: str) -> None:
 
     if generate:
         if not account_id.strip():
-            st.error("Enter an account ID.")
+            st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
         elif not (cohort_tag or "").strip():
             st.error("Select or enter a location tag.")
         else:
@@ -287,7 +287,7 @@ def _render_retail_channels(account_id: str) -> None:
 
     if run:
         if not account_id.strip():
-            st.error("Enter an account ID.")
+            st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
             st.stop()
 
         location_ids = _parse_location_ids(location_raw)
@@ -380,7 +380,7 @@ def _render_opening_hours_export(account_id: str) -> None:
 
     if st.button("Fetch opening hours", type="primary", key="hours_export_btn"):
         if not account_id.strip():
-            st.error("Enter an account ID.")
+            st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
         else:
             progress_bar = st.progress(0.0, text="Starting export…")
             status = st.empty()
@@ -517,7 +517,7 @@ def _render_opening_hours_import(account_id: str) -> None:
             )
         elif st.button("Import opening hours", type="primary", key="hours_import_btn"):
             if not account_id.strip():
-                st.error("Enter an account ID.")
+                st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
             else:
                 payloads = st.session_state["hours_import_payloads"]
                 progress = st.progress(0.0, text="Starting import…")
@@ -559,7 +559,18 @@ def _render_opening_hours_import(account_id: str) -> None:
 
 
 def _get_account_id() -> str:
-    return (st.session_state.get("account_id_input") or "").strip()
+    return (os.getenv("ACCOUNT_ID") or "").strip()
+
+
+def _sign_out_footer() -> None:
+    st.divider()
+    _, col, _ = st.columns([2, 1, 2])
+    with col:
+        if st.button("Sign out", key="sign_out", use_container_width=True):
+            st.session_state.pop("authenticated", None)
+            st.session_state.pop("hours_page_tracked", None)
+            st.session_state.pop("tool_page_tracked", None)
+            st.rerun()
 
 
 def page_opening_hours_export() -> None:
@@ -569,6 +580,7 @@ def page_opening_hours_export() -> None:
     )
     _track_hours_page("Export")
     _render_opening_hours_export(_get_account_id())
+    _sign_out_footer()
 
 
 def page_opening_hours_import() -> None:
@@ -578,6 +590,7 @@ def page_opening_hours_import() -> None:
     )
     _track_hours_page("Import")
     _render_opening_hours_import(_get_account_id())
+    _sign_out_footer()
 
 
 def page_channel_activation() -> None:
@@ -587,6 +600,7 @@ def page_channel_activation() -> None:
     st.title("Channel activation emails")
     st.caption("Generate partner emails with store lists and channel link IDs.")
     _render_channel_activation_emails(_get_account_id())
+    _sign_out_footer()
 
 
 st.set_page_config(
@@ -596,35 +610,13 @@ st.set_page_config(
 )
 _require_password()
 
-if "account_id_input" not in st.session_state:
-    st.session_state.account_id_input = (os.getenv("ACCOUNT_ID") or "").strip()
-
-with st.sidebar:
-    st.markdown("### Onestop Toolkit")
-    if st.button("Sign out", key="sign_out", use_container_width=True):
-        st.session_state.pop("authenticated", None)
-        st.session_state.pop("hours_page_tracked", None)
-        st.session_state.pop("tool_page_tracked", None)
-        st.rerun()
-    st.divider()
-    st.header("Account")
-    st.text_input(
-        "Account ID",
-        placeholder="Deliverect account _id",
-        help=(
-            "Deliverect account `_id`. "
-            "Set a default in `.env` as `ACCOUNT_ID=...` or enter it here."
-        ),
-        key="account_id_input",
-    )
-
 pages = {
     "Opening hours": [
         st.Page(page_opening_hours_export, title="Export", icon=":material/upload:"),
         st.Page(page_opening_hours_import, title="Import", icon=":material/download:"),
     ],
-    "Partner emails": [
-        st.Page(page_channel_activation, title="Channel activation", icon=":material/mail:"),
+    "Channel activation": [
+        st.Page(page_channel_activation, title="Partner emails", icon=":material/mail:"),
     ],
 }
 
