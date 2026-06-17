@@ -10,7 +10,7 @@ import io
 import os
 import re
 import secrets
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from io import StringIO
 from typing import Optional
 
@@ -18,11 +18,18 @@ import requests as _requests
 import streamlit as st
 from dotenv import load_dotenv
 
+from channel_activation import (
+    PARTNER_ORDER,
+    build_all_partner_emails,
+    extract_unique_location_tags,
+    fetch_activation_data,
+)
 from main import createRetailChannels
 from utils import (
     OPENING_HOURS_CSV_COLUMNS,
     analyze_opening_hours_csv_rows,
     fetch_opening_hours_csv_rows,
+    getAllLocations,
     import_opening_hours_payloads,
     load_opening_hours_import_payloads_from_rows,
     opening_hours_csv_text,
@@ -83,6 +90,118 @@ def _require_password() -> None:
             st.error("Incorrect password.")
 
     st.stop()
+
+
+def _track_tool_page(tool: str) -> None:
+    if tool == "Opening hours":
+        return
+    if st.session_state.get("tool_page_tracked") != tool:
+        _track_page("OS Channel Activation")
+        st.session_state["tool_page_tracked"] = tool
+
+
+def _render_channel_activation_emails(account_id: str) -> None:
+    st.subheader("Channel activation emails")
+    st.markdown(
+        "Build partner-specific emails for **Uber Eats**, **Deliveroo**, and **Just Eat** "
+        "using locations filtered by tag. Each email lists the stores and IDs the partner "
+        "needs to activate."
+    )
+
+    go_live_date = st.date_input(
+        "Target go-live date",
+        value=date.today(),
+        help="When stores should be live and accepting orders.",
+        key="activation_go_live_date",
+    )
+
+    load_tags = st.button("Load location tags", key="activation_load_tags")
+    if load_tags:
+        if not account_id.strip():
+            st.error("Enter an account ID.")
+        else:
+            with st.spinner("Fetching locations…"):
+                try:
+                    tags = extract_unique_location_tags(getAllLocations(account_id.strip()))
+                    st.session_state["activation_tags"] = tags
+                except Exception as exc:
+                    st.exception(exc)
+                    st.stop()
+            st.success(f"Found {len(tags)} tag(s).")
+
+    tags = st.session_state.get("activation_tags") or []
+    if not tags:
+        st.info("Load location tags to choose which store batch to include.")
+        cohort_tag = st.text_input(
+            "Or enter a tag manually",
+            placeholder="e.g. New 17/06",
+            key="activation_tag_manual",
+        )
+    else:
+        cohort_tag = st.selectbox("Location tag", tags, key="activation_tag_select")
+
+    generate = st.button("Generate emails", type="primary", key="activation_generate")
+
+    if generate:
+        if not account_id.strip():
+            st.error("Enter an account ID.")
+        elif not (cohort_tag or "").strip():
+            st.error("Select or enter a location tag.")
+        else:
+            with st.spinner("Fetching channel links and building emails…"):
+                try:
+                    grouped = fetch_activation_data(account_id.strip(), tag=cohort_tag.strip())
+                    emails = build_all_partner_emails(
+                        grouped,
+                        cohort_tag=cohort_tag.strip(),
+                        action_date=go_live_date,
+                        go_live_date=go_live_date,
+                    )
+                except Exception as exc:
+                    st.exception(exc)
+                    st.stop()
+
+            st.session_state["activation_emails"] = emails
+            st.session_state["activation_grouped"] = grouped
+            st.session_state["activation_cohort"] = cohort_tag.strip()
+            total = sum(len(grouped.get(p) or []) for p in PARTNER_ORDER)
+            st.success(f"Generated emails for {total} channel link(s) in tag “{cohort_tag.strip()}”.")
+            st.rerun()
+
+    if "activation_emails" in st.session_state:
+        emails = st.session_state["activation_emails"]
+        grouped = st.session_state.get("activation_grouped", {})
+
+        st.divider()
+        st.subheader("Generated emails")
+        st.caption("Copy the subject and body below, or download as .txt for each partner.")
+
+        summary_cols = st.columns(len(PARTNER_ORDER))
+        for idx, partner in enumerate(PARTNER_ORDER):
+            summary_cols[idx].metric(partner, len(grouped.get(partner) or []))
+
+        partner_tabs = st.tabs(list(PARTNER_ORDER))
+        for tab, partner in zip(partner_tabs, PARTNER_ORDER):
+            email = emails[partner]
+            with tab:
+                if email["store_count"] == 0:
+                    st.info(f"No {partner} channel links in this tag.")
+                    continue
+
+                st.text_input("Subject", value=email["subject"], key=f"activation_subject_{partner}")
+                st.text_area(
+                    "Email body",
+                    value=email["body"],
+                    height=420,
+                    key=f"activation_body_{partner}",
+                )
+                st.download_button(
+                    label=f"Download {partner} email",
+                    data=email["body"].encode("utf-8"),
+                    file_name=f"{partner.lower().replace(' ', '_')}_activation.txt",
+                    mime="text/plain",
+                    key=f"activation_download_{partner}",
+                )
 
 
 def _parse_location_ids(raw: str) -> list:
@@ -451,11 +570,6 @@ def _render_opening_hours_import(account_id: str) -> None:
 st.set_page_config(page_title="Onestop Toolkit", layout="wide")
 _require_password()
 
-st.title("Opening hours")
-st.caption(
-    "Export channel link opening hours to CSV, edit in Excel, then import back using the same format. "
-)
-
 if "account_id_input" not in st.session_state:
     st.session_state.account_id_input = (os.getenv("ACCOUNT_ID") or "").strip()
 
@@ -463,6 +577,7 @@ with st.sidebar:
     if st.button("Sign out", key="sign_out"):
         st.session_state.pop("authenticated", None)
         st.session_state.pop("hours_page_tracked", None)
+        st.session_state.pop("tool_page_tracked", None)
         st.rerun()
     st.header("Account")
     account_id = st.text_input(
@@ -475,16 +590,33 @@ with st.sidebar:
         key="account_id_input",
     )
 
-hours_page = st.radio(
-    "Section",
-    ["Export", "Import"],
+tool = st.radio(
+    "Tool",
+    ["Opening hours", "Channel activation emails"],
     horizontal=True,
     label_visibility="collapsed",
-    key="hours_page",
+    key="app_tool",
 )
-_track_hours_page(hours_page)
+_track_tool_page(tool)
 
-if hours_page == "Export":
-    _render_opening_hours_export(account_id)
+if tool == "Opening hours":
+    st.title("Opening hours")
+    st.caption(
+        "Export channel link opening hours to CSV, edit in Excel, then import back using the same format."
+    )
+    hours_page = st.radio(
+        "Section",
+        ["Export", "Import"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="hours_page",
+    )
+    _track_hours_page(hours_page)
+    if hours_page == "Export":
+        _render_opening_hours_export(account_id)
+    else:
+        _render_opening_hours_import(account_id)
 else:
-    _render_opening_hours_import(account_id)
+    st.title("Channel activation emails")
+    st.caption("Generate partner emails with store lists and channel link IDs.")
+    _render_channel_activation_emails(account_id)

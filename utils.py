@@ -116,6 +116,7 @@ def getAllLocations(account: str, progress_callback=None):
 
             items = data.get("_items", [])
             if not items:
+                print("No more location to be found.")
                 break
             location_list.extend(items)
             if progress_callback:
@@ -263,6 +264,7 @@ def getAllChannelLinks(account: str, group_by_channel: bool = True, progress_cal
 
         items = response.json().get("_items", [])
         if not items:
+            print("No more channelLinks to be found")
             break
 
         all_channelLinks.extend(items)
