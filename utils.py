@@ -14,6 +14,57 @@ from datetime import datetime, time as dt_time
 import requests
 from auth import getHeaders
 
+def post_opening_hours_and_update_channels(
+    locations: list,
+    *,
+    raise_on_error: bool = True,
+    debug: bool = False,
+):
+    """POST opening hours for one or more locations and trigger channel updates."""
+    url = "https://api.deliverect.io/locations/channels/updateOpeningHours"
+    payload = {"locations": locations, "enhanceOpeningHours": True}
+    if debug:
+        print(f"\n--- POST updateOpeningHours ---")
+        print(f"Request: POST {url}")
+        print(f"Payload: {json.dumps(payload, indent=2)}")
+    response = requests.post(url, headers=getHeaders(), json=payload)
+    if debug:
+        print(f"Response: {_api_response_detail(response)}")
+    if not _http_ok(response):
+        if raise_on_error:
+            raise RuntimeError(
+                f"POST locations/channels/updateOpeningHours: {_api_response_detail(response)}"
+            )
+        return False
+    if not (response.content or b"").strip():
+        return True
+    try:
+        return response.json()
+    except ValueError:
+        return True
+
+
+def postOpeningHoursAndUpdateChannels(locationId: str, channelLinkId: str, openingHours: list):
+    """Update opening hours for a single channel link at a location."""
+    return post_opening_hours_and_update_channels(
+        [
+            {
+                "id": locationId,
+                "channels": [{"id": channelLinkId, "openingHours": openingHours}],
+                "triggerUpdate": True,
+            }
+        ]
+    )
+
+
+
+def activateUberEats(channelLinkId: str):
+    url =f"https://api.deliverect.io/v2/channelLinks/{channelLinkId}/activate"
+    response = requests.post(url, headers=getHeaders())
+    if not _http_ok(response):
+        return False
+    return response.json()
+
 
 def _http_ok(response: requests.Response) -> bool:
     """True if HTTP status is 2xx (e.g. 200 or 201)."""
@@ -363,6 +414,7 @@ def opening_hours_from_csv_row(row: dict) -> list:
 def inspect_opening_hours_row(row: dict) -> dict:
     """Classify a CSV row for import preview and payload building."""
     channel_link_id = (row.get("channelLinkId") or "").strip()
+    location_id = (row.get("locationId") or "").strip()
     hours = opening_hours_from_csv_row(row)
     missing_days = []
     invalid_days = []
@@ -380,6 +432,8 @@ def inspect_opening_hours_row(row: dict) -> dict:
     day_count = len(hours)
     if not channel_link_id:
         status = "skipped_no_id"
+    elif not location_id:
+        status = "skipped_no_location"
     elif invalid_days:
         status = "skipped_invalid"
     elif day_count == 0:
@@ -390,6 +444,7 @@ def inspect_opening_hours_row(row: dict) -> dict:
         status = "full"
 
     return {
+        "locationId": location_id,
         "channelLinkId": channel_link_id,
         "hours": hours,
         "day_count": day_count,
@@ -417,7 +472,11 @@ def load_opening_hours_import_payloads_from_rows(rows: list) -> list:
         if not info["importable"]:
             continue
         payloads.append(
-            {"channelLinkId": info["channelLinkId"], "openingHours": info["hours"]}
+            {
+                "locationId": info["locationId"],
+                "channelLinkId": info["channelLinkId"],
+                "openingHours": info["hours"],
+            }
         )
     return payloads
 
@@ -441,6 +500,7 @@ def analyze_opening_hours_csv_rows(rows: list) -> dict:
     full_week = 0
     partial = 0
     skipped_no_id = 0
+    skipped_no_location = 0
     skipped_no_hours = 0
     skipped_invalid = 0
     row_details = []
@@ -457,6 +517,8 @@ def analyze_opening_hours_csv_rows(rows: list) -> dict:
         status = info["status"]
         if status == "skipped_no_id":
             skipped_no_id += 1
+        elif status == "skipped_no_location":
+            skipped_no_location += 1
         elif status == "skipped_invalid":
             skipped_invalid += 1
         elif status == "skipped_no_hours":
@@ -474,6 +536,7 @@ def analyze_opening_hours_csv_rows(rows: list) -> dict:
         "full_week": full_week,
         "partial": partial,
         "skipped_no_id": skipped_no_id,
+        "skipped_no_location": skipped_no_location,
         "skipped_no_hours": skipped_no_hours,
         "skipped_invalid": skipped_invalid,
         "row_details": row_details,
@@ -544,39 +607,30 @@ def exportChannelLinksOpeningHoursCsv(account: str, filepath: str) -> None:
         writer.writerows(rows)
 
 
-def _update_channel_link_opening_hours(
-    payload: dict,
-    channel_links_by_id: dict,
+def group_opening_hours_payloads_by_location(payloads: list) -> list[dict]:
+    """Group channel opening-hour payloads by location for bulk API calls."""
+    by_location: dict[str, list] = {}
+    for payload in payloads:
+        location_id = payload["locationId"]
+        by_location.setdefault(location_id, []).append(
+            {
+                "id": payload["channelLinkId"],
+                "openingHours": payload["openingHours"],
+            }
+        )
+    return [
+        {"id": location_id, "channels": channels, "triggerUpdate": True}
+        for location_id, channels in by_location.items()
+    ]
+
+
+def _post_location_opening_hours(
+    location_payload: dict,
     *,
     debug: bool = False,
 ) -> None:
-    channel_link_id = payload["channelLinkId"]
-    if channel_link_id not in channel_links_by_id:
-        raise ValueError(
-            f"Channel link {channel_link_id} not found in account (from getAllChannelLinks)"
-        )
-
-    if debug:
-        print(f"\n=== {channel_link_id} ===")
-        print(f"CSV channelLinkId: {channel_link_id}")
-
-    # Fresh GET so _etag is current right before PATCH (not from CSV).
-    info = getChannelLink(channel_link_id)
-    if not info:
-        raise ValueError(f"Could not fetch channel link {channel_link_id}")
-    etag = info.get("_etag")
-    if not etag:
-        raise ValueError(f"No _etag on channel link {channel_link_id}")
-
-    if debug:
-        print(f"GET channelLinks/{channel_link_id}")
-        print(f"_etag from GET: {etag}")
-
-    patch_payload = {"openingHours": payload["openingHours"]}
-    updateChannelLink(
-        channel_link_id,
-        patch_payload,
-        etag,
+    post_opening_hours_and_update_channels(
+        [location_payload],
         raise_on_error=True,
         debug=debug,
     )
@@ -590,42 +644,40 @@ def import_opening_hours_payloads(
     debug: bool = False,
     progress_callback=None,
 ) -> tuple:
-    """PATCH opening hours onto channel links from prepared payloads."""
+    """POST opening hours via locations/channels/updateOpeningHours from CSV payloads."""
     if debug and workers > 1:
         print("Debug mode: using 1 worker for readable output")
         workers = 1
 
-    channel_links = getAllChannelLinks(account)
-    channel_links_by_id = {
-        link["_id"]: link for link in channel_links if link.get("_id")
-    }
+    location_payloads = group_opening_hours_payloads_by_location(payloads)
 
     ok = 0
     failures = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(
-                _update_channel_link_opening_hours,
-                payload,
-                channel_links_by_id,
+                _post_location_opening_hours,
+                location_payload,
                 debug=debug,
-            ): payload
-            for payload in payloads
+            ): location_payload
+            for location_payload in location_payloads
         }
         for future in as_completed(futures):
-            payload = futures[future]
-            channel_link_id = payload["channelLinkId"]
+            location_payload = futures[future]
+            channel_ids = [ch["id"] for ch in location_payload.get("channels") or []]
             try:
                 future.result()
-                ok += 1
+                ok += len(channel_ids)
                 if progress_callback:
-                    progress_callback("ok", channel_link_id, None)
+                    for channel_link_id in channel_ids:
+                        progress_callback("ok", channel_link_id, None)
             except Exception as exc:
                 msg = str(exc)
-                failures.append({"channelLinkId": channel_link_id, "error": msg})
-                print(f"FAIL {channel_link_id}: {exc}")
-                if progress_callback:
-                    progress_callback("fail", channel_link_id, msg)
+                for channel_link_id in channel_ids:
+                    failures.append({"channelLinkId": channel_link_id, "error": msg})
+                    print(f"FAIL {channel_link_id}: {exc}")
+                    if progress_callback:
+                        progress_callback("fail", channel_link_id, msg)
 
     return ok, len(payloads), failures
 
@@ -637,7 +689,7 @@ def importChannelLinksOpeningHoursCsv(
     *,
     debug: bool = False,
 ) -> tuple:
-    """Read export-format CSV and PATCH opening hours onto channel links."""
+    """Read export-format CSV and POST opening hours via updateOpeningHours API."""
     payloads = load_opening_hours_import_payloads(filepath)
 
     if debug:

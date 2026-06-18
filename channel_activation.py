@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from datetime import date
+from io import BytesIO
 from typing import Optional
+
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
 from utils import _channel_link_ids_from_location, getAllChannelLinks, getAllLocations
 
@@ -191,6 +195,68 @@ def fetch_activation_data(account: str, tag: str = "") -> dict[str, list[dict]]:
     locations = getAllLocations(account)
     channel_links = getAllChannelLinks(account)
     return collect_activation_data(locations, channel_links, tag=tag)
+
+
+def _excel_sheet_headers(partner: str) -> list[str]:
+    if partner == "Uber Eats":
+        return [
+            "Store name",
+            "Uber Store ID",
+            "Channel link ID",
+            "Channel link name",
+            "Location ID",
+        ]
+    return ["Store name", "Channel link ID", "Channel link name", "Location ID"]
+
+
+def _excel_sheet_row(partner: str, row: dict) -> list:
+    if partner == "Uber Eats":
+        return [
+            row["location_name"],
+            row["partner_ref"] or "",
+            row["channel_link_id"],
+            row["channel_link_name"],
+            row["location_id"],
+        ]
+    return [
+        row["location_name"],
+        row["channel_link_id"],
+        row["channel_link_name"],
+        row["location_id"],
+    ]
+
+
+def _autosize_worksheet_columns(ws) -> None:
+    for col_idx, column_cells in enumerate(ws.columns, start=1):
+        max_length = 0
+        for cell in column_cells:
+            if cell.value is not None:
+                max_length = max(max_length, len(str(cell.value)))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_length + 2, 60)
+
+
+def activation_channels_excel_bytes(grouped: dict[str, list[dict]]) -> bytes:
+    """Build an Excel workbook with one sheet per delivery partner."""
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    for partner in PARTNER_ORDER:
+        ws = wb.create_sheet(title=partner[:31])
+        headers = _excel_sheet_headers(partner)
+        ws.append(headers)
+        for row in grouped.get(partner) or []:
+            ws.append(_excel_sheet_row(partner, row))
+        _autosize_worksheet_columns(ws)
+
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def activation_channels_excel_filename(cohort_tag: str) -> str:
+    slug = cohort_tag.strip().lower().replace(" ", "_").replace("/", "-")
+    slug = "".join(ch for ch in slug if ch.isalnum() or ch in "-_") or "batch"
+    return f"channel_activation_{slug}.xlsx"
 
 
 def _markdown_table(headers: list[str], rows: list[list[str]]) -> str:

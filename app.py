@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 
 from channel_activation import (
     PARTNER_ORDER,
+    activation_channels_excel_bytes,
+    activation_channels_excel_filename,
     build_all_partner_emails,
     extract_unique_location_tags,
     fetch_activation_data,
@@ -166,11 +168,21 @@ def _render_channel_activation_emails(account_id: str) -> None:
 
         st.divider()
         st.subheader("Generated emails")
-        st.caption("Copy the subject and body below, or download as .txt for each partner.")
+        st.caption("Copy the subject and body below, download partner emails, or export channel data to Excel.")
 
         summary_cols = st.columns(len(PARTNER_ORDER))
         for idx, partner in enumerate(PARTNER_ORDER):
             summary_cols[idx].metric(partner, len(grouped.get(partner) or []))
+
+        cohort = st.session_state.get("activation_cohort", "batch")
+        st.download_button(
+            label="Download channels Excel",
+            data=activation_channels_excel_bytes(grouped),
+            file_name=activation_channels_excel_filename(cohort),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            key="activation_channels_excel",
+        )
 
         partner_tabs = st.tabs(list(PARTNER_ORDER))
         for tab, partner in zip(partner_tabs, PARTNER_ORDER):
@@ -252,6 +264,7 @@ def _import_preview_row(detail: dict) -> dict:
         "full": "Ready (7/7)",
         "partial": "Partial",
         "skipped_no_id": "No channel link ID",
+        "skipped_no_location": "No location ID",
         "skipped_no_hours": "No opening hours",
         "skipped_invalid": "Invalid hours",
     }
@@ -450,7 +463,7 @@ def _render_opening_hours_import(account_id: str) -> None:
     st.subheader("Import from CSV")
     st.markdown(
         "Upload the same CSV format produced by export. "
-        "Rows need a `channelLinkId` and at least one valid day. "
+        "Rows need a `channelLinkId`, `locationId`, and at least one valid day. "
         "Closed or blank days are omitted from the import payload."
     )
 
@@ -489,7 +502,13 @@ def _render_opening_hours_import(account_id: str) -> None:
         c1.metric("Total rows", summary["total_rows"])
         c2.metric("Ready to import", summary["importable"])
         c3.metric("Partial (closed days)", summary.get("partial", 0))
-        c4.metric("Skipped", summary["skipped_no_id"] + summary.get("skipped_no_hours", 0) + summary.get("skipped_invalid", 0))
+        c4.metric(
+            "Skipped",
+            summary["skipped_no_id"]
+            + summary.get("skipped_no_location", 0)
+            + summary.get("skipped_no_hours", 0)
+            + summary.get("skipped_invalid", 0),
+        )
 
         if partial_rows:
             st.warning(
@@ -514,7 +533,7 @@ def _render_opening_hours_import(account_id: str) -> None:
 
         if summary["importable"] == 0:
             st.warning(
-                "No rows are ready to import. Each row needs a channelLinkId and at least one valid day."
+                "No rows are ready to import. Each row needs a channelLinkId, locationId, and at least one valid day."
             )
         elif st.button("Import opening hours", type="primary", key="hours_import_btn"):
             if not account_id.strip():
