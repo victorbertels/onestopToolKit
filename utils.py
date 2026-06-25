@@ -805,7 +805,11 @@ INVENTORY_SYNC_TYPE_LISTING_UPDATE = "Listing update"
 INVENTORY_SYNC_DEFAULT_OPERATION_TYPES = [1101]
 INVENTORY_SYNC_DEFAULT_CHANNELS = [6002, 2]
 OPERATION_REPORT_BASE_URL = "https://retail.deliverect.com/operationreports"
-LONDON_TZ = ZoneInfo("Europe/London")
+
+
+def get_london_tz() -> ZoneInfo:
+    """Lazy load — avoids import failure when tzdata is missing at module init."""
+    return ZoneInfo("Europe/London")
 
 
 def inventory_sync_created_range_for_date(day) -> tuple[str, str]:
@@ -828,7 +832,7 @@ def parse_utc_iso(iso_str: str) -> Optional[datetime]:
 
 
 def london_now() -> datetime:
-    return datetime.now(LONDON_TZ)
+    return datetime.now(get_london_tz())
 
 
 def london_date_time_to_utc_iso(
@@ -837,7 +841,7 @@ def london_date_time_to_utc_iso(
     *,
     end_of_second: bool = False,
 ) -> str:
-    dt = datetime.combine(day, clock, tzinfo=LONDON_TZ)
+    dt = datetime.combine(day, clock, tzinfo=get_london_tz())
     utc = dt.astimezone(timezone.utc)
     suffix = ".999Z" if end_of_second else ".000Z"
     return utc.strftime(f"%Y-%m-%dT%H:%M:%S{suffix}")
@@ -867,7 +871,7 @@ def format_operation_created(iso_str: str) -> str:
     created = parse_utc_iso(iso_str)
     if not created:
         return iso_str or "—"
-    london = created.astimezone(LONDON_TZ)
+    london = created.astimezone(get_london_tz())
     tz_label = london.tzname() or "London"
     return london.strftime(f"%H:%M:%S {tz_label}, %d %b %Y")
 
