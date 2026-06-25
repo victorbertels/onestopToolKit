@@ -10,7 +10,7 @@ import io
 import os
 import re
 import secrets
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from io import StringIO
 from typing import Optional
 
@@ -29,11 +29,18 @@ from channel_activation import (
 from main import createRetailChannels
 from utils import (
     OPENING_HOURS_CSV_COLUMNS,
+    INVENTORY_SYNC_DEFAULT_CHANNELS,
+    INVENTORY_SYNC_DEFAULT_OPERATION_TYPES,
+    analyse_inventory_sync_reports,
     analyze_opening_hours_csv_rows,
+    build_inventory_sync_table_rows,
     fetch_opening_hours_csv_rows,
     getAllLocations,
+    getAllOperationReports,
     import_opening_hours_payloads,
+    inventory_sync_range_london,
     load_opening_hours_import_payloads_from_rows,
+    london_now,
     opening_hours_csv_text,
 )
 
@@ -619,6 +626,145 @@ def page_channel_activation() -> None:
     _render_channel_activation_emails(_get_account_id())
 
 
+def _render_inventory_sync_analysis(account_id: str) -> None:
+    if not account_id:
+        st.error("ACCOUNT_ID is not configured. Set it in the environment or vault.")
+        st.stop()
+
+    st.markdown(
+        "Analyse **Deliveroo inventory sync** operation reports. "
+        "Pick a report date and time range in **London time**; times in the table use the same timezone."
+    )
+
+    report_date = st.date_input(
+        "Report date",
+        value=london_now().date(),
+        key="inventory_sync_report_date",
+    )
+
+    from_col, to_col = st.columns(2)
+    with from_col:
+        from_time = st.time_input(
+            "From",
+            value=time(0, 0),
+            key="inventory_sync_from_time",
+        )
+    with to_col:
+        to_time = st.time_input(
+            "To",
+            value=time(23, 59, 59),
+            key="inventory_sync_to_time",
+        )
+
+    created_after, created_before, range_label = inventory_sync_range_london(
+        report_date, from_time, to_time
+    )
+    filter_key = f"{report_date}|{from_time}|{to_time}"
+
+    if created_after >= created_before:
+        st.error("From must be earlier than To.")
+        st.stop()
+
+    st.caption(
+        f"London window: **{range_label}** · "
+        f"API query (UTC): `{created_after}` → `{created_before}`"
+    )
+
+    with st.expander("Filters"):
+        operation_types = st.multiselect(
+            "Operation types",
+            options=INVENTORY_SYNC_DEFAULT_OPERATION_TYPES,
+            default=INVENTORY_SYNC_DEFAULT_OPERATION_TYPES,
+        )
+        channels = st.multiselect(
+            "Channels",
+            options=INVENTORY_SYNC_DEFAULT_CHANNELS,
+            default=INVENTORY_SYNC_DEFAULT_CHANNELS,
+        )
+
+    if st.button("Run analysis", type="primary", key="inventory_sync_run"):
+        if not operation_types or not channels:
+            st.error("Select at least one operation type and one channel.")
+            st.stop()
+
+        with st.spinner("Fetching operation reports and locations…"):
+            try:
+                reports = getAllOperationReports(
+                    account_id,
+                    operation_types=operation_types,
+                    channels=channels,
+                    created_after=created_after,
+                    created_before=created_before,
+                )
+                locations = getAllLocations(account_id)
+                location_names = {
+                    loc.get("_id"): loc.get("name", "")
+                    for loc in locations
+                    if loc.get("_id")
+                }
+                analysis = analyse_inventory_sync_reports(reports)
+                rows = build_inventory_sync_table_rows(reports, location_names)
+            except RuntimeError as exc:
+                st.error(str(exc))
+                st.stop()
+
+        st.session_state["inventory_sync_result"] = {
+            "analysis": analysis,
+            "rows": rows,
+            "filter_key": filter_key,
+            "range_label": range_label,
+            "created_after": created_after,
+            "created_before": created_before,
+        }
+
+    result = st.session_state.get("inventory_sync_result")
+    if not result:
+        return
+
+    if result.get("filter_key") != filter_key:
+        st.info("Time range changed — click **Run analysis** to refresh.")
+        return
+
+    analysis = result["analysis"]
+    rows = result["rows"]
+
+    st.subheader(f"Results — {result['range_label']}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total reports", analysis["total"])
+    c2.metric("Success", analysis["success_count"])
+    c3.metric("Failed", analysis["fail_count"])
+    c4.metric("Success rate", f"{analysis['success_rate']:.1f}%")
+
+    c5, c6 = st.columns(2)
+    c5.metric("Snooze fallback", len(analysis["snooze_backup"]))
+    c6.metric("Listing update", len(analysis["normal_listings"]))
+
+    if not rows:
+        st.info("No operation reports found for this date and filters.")
+        return
+
+    st.dataframe(
+        rows,
+        column_config={
+            "Report URL": st.column_config.LinkColumn(
+                "Report URL",
+                display_text="Open report",
+            ),
+        },
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def page_inventory_sync() -> None:
+    if st.session_state.get("tool_page_tracked") != "Inventory sync":
+        _track_page("OS Inventory Sync")
+        st.session_state["tool_page_tracked"] = "Inventory sync"
+    st.title("Inventory sync")
+    st.caption("Deliveroo inventory sync operation reports by location.")
+    _render_inventory_sync_analysis(_get_account_id())
+
+
 st.set_page_config(
     page_title="Onestop Toolkit",
     layout="wide",
@@ -654,6 +800,9 @@ pages = {
     ],
     "Channel activation": [
         st.Page(page_channel_activation, title="Partner emails", icon=":material/mail:"),
+    ],
+    "Inventory sync": [
+        st.Page(page_inventory_sync, title="Analysis", icon=":material/inventory_2:"),
     ],
 }
 

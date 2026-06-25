@@ -9,7 +9,9 @@ import io
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, time as dt_time
+from datetime import date, datetime, timedelta, time as dt_time, timezone
+from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from auth import getHeaders
@@ -745,6 +747,230 @@ def markLocationAndChannelLinksAsSuspended(locationObject: dict) -> bool:
         updateLocation(loc_id, location_payload, loc_etag)
     )
     return channel_updates_ok and location_patch_ok
+
+
+def getAllOperationReports(
+    account: str,
+    *,
+    operation_types: list,
+    channels: list,
+    created_after: str,
+    created_before: str,
+    max_results: int = 500,
+) -> list:
+    """Fetch operation reports matching filters (paginated).
+
+    Same pattern as RetailTools/snoozeHistory/snoozeHistoryPerPlu.py:
+    GET https://api.deliverect.com/operationReports?where=<json>&max_results=...
+    """
+    where = {
+        "operationType": {"$in": operation_types},
+        "channel": {"$in": channels},
+        "account": {"$in": [account]},
+        "_created": {"$gt": created_after, "$lt": created_before},
+    }
+    where_str = json.dumps(where)
+    all_reports = []
+    page = 1
+
+    while True:
+        url = (
+            "https://api.deliverect.com/operationReports"
+            f"?where={where_str}&max_results={max_results}&page={page}&sort=-_created"
+        )
+        response = requests.get(url, headers=getHeaders())
+        if not _http_ok(response):
+            raise RuntimeError(
+                f"GET operationReports page {page}: {_api_response_detail(response)}"
+            )
+
+        items = response.json().get("_items", [])
+        if not items:
+            break
+
+        all_reports.extend(items)
+        if len(items) < max_results:
+            break
+        page += 1
+        print(f"Fetching operation reports on page {page}")
+
+    _assert_unique_ids(all_reports, "operationReports")
+    return all_reports
+
+
+INVENTORY_SYNC_RATE_LIMIT_MESSAGE = "Listings update rate-limited (429)"
+INVENTORY_SYNC_SUCCESS_STATUS = 90
+INVENTORY_SYNC_TYPE_SNOOZE_FALLBACK = "Snooze fallback"
+INVENTORY_SYNC_TYPE_LISTING_UPDATE = "Listing update"
+INVENTORY_SYNC_DEFAULT_OPERATION_TYPES = [1101]
+INVENTORY_SYNC_DEFAULT_CHANNELS = [6002, 2]
+OPERATION_REPORT_BASE_URL = "https://retail.deliverect.com/operationreports"
+LONDON_TZ = ZoneInfo("Europe/London")
+
+
+def inventory_sync_created_range_for_date(day) -> tuple[str, str]:
+    """UTC window for a calendar day: prev day 23:00 → date 22:59:59."""
+    if isinstance(day, str):
+        day = datetime.strptime(day, "%Y-%m-%d").date()
+    day_before = day - timedelta(days=1)
+    created_after = f"{day_before.isoformat()}T23:00:00.000Z"
+    created_before = f"{day.isoformat()}T22:59:59.999Z"
+    return created_after, created_before
+
+
+def parse_utc_iso(iso_str: str) -> Optional[datetime]:
+    if not iso_str:
+        return None
+    try:
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def london_now() -> datetime:
+    return datetime.now(LONDON_TZ)
+
+
+def london_date_time_to_utc_iso(
+    day: date,
+    clock: dt_time,
+    *,
+    end_of_second: bool = False,
+) -> str:
+    dt = datetime.combine(day, clock, tzinfo=LONDON_TZ)
+    utc = dt.astimezone(timezone.utc)
+    suffix = ".999Z" if end_of_second else ".000Z"
+    return utc.strftime(f"%Y-%m-%dT%H:%M:%S{suffix}")
+
+
+def inventory_sync_range_london(
+    report_date: date,
+    from_time: dt_time,
+    to_time: dt_time,
+) -> tuple[str, str, str]:
+    """UTC API window from a London report date and time range."""
+    to_day = report_date
+    if to_time <= from_time:
+        to_day = report_date + timedelta(days=1)
+    created_after = london_date_time_to_utc_iso(report_date, from_time)
+    created_before = london_date_time_to_utc_iso(
+        to_day, to_time, end_of_second=True
+    )
+    range_label = (
+        f"{report_date.isoformat()} "
+        f"{from_time.strftime('%H:%M')}–{to_time.strftime('%H:%M')} London"
+    )
+    return created_after, created_before, range_label
+
+
+def format_operation_created(iso_str: str) -> str:
+    created = parse_utc_iso(iso_str)
+    if not created:
+        return iso_str or "—"
+    london = created.astimezone(LONDON_TZ)
+    tz_label = london.tzname() or "London"
+    return london.strftime(f"%H:%M:%S {tz_label}, %d %b %Y")
+
+
+def build_inventory_sync_table_rows(
+    operation_reports: list,
+    location_names: dict,
+) -> list[dict]:
+    """One row per operation report for UI tables."""
+    rows = []
+    for op in operation_reports:
+        op_id = op.get("_id") or ""
+        location_id = op.get("location") or ""
+        status = op.get("operationStatus")
+        created = op.get("_created") or ""
+        messages = [(entry.get("message") or "") for entry in (op.get("log") or [])]
+        is_snooze_fallback = any(
+            INVENTORY_SYNC_RATE_LIMIT_MESSAGE in message for message in messages
+        )
+        location_name = location_names.get(location_id) or location_id or "—"
+
+        rows.append(
+            {
+                "Time": format_operation_created(created),
+                "Location": location_name,
+                "Type": INVENTORY_SYNC_TYPE_SNOOZE_FALLBACK
+                if is_snooze_fallback
+                else INVENTORY_SYNC_TYPE_LISTING_UPDATE,
+                "Result": "Success"
+                if status == INVENTORY_SYNC_SUCCESS_STATUS
+                else "Failed",
+                "Report URL": f"{OPERATION_REPORT_BASE_URL}/{op_id}" if op_id else "",
+                "_created": created,
+            }
+        )
+
+    rows.sort(key=lambda row: row["_created"], reverse=True)
+    for row in rows:
+        row.pop("_created", None)
+    return rows
+
+
+def analyse_inventory_sync_reports(
+    operation_reports: list,
+    *,
+    rate_limit_message: str = INVENTORY_SYNC_RATE_LIMIT_MESSAGE,
+    success_status: int = INVENTORY_SYNC_SUCCESS_STATUS,
+) -> dict:
+    snooze_backup = set()
+    snooze_backup_location_ids = set()
+    normal_listings = set()
+    success_count = 0
+    fail_count = 0
+    status_counts = {}
+    rate_limited_details = []
+
+    for op in operation_reports:
+        status = op.get("operationStatus")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+        if status == success_status:
+            success_count += 1
+        else:
+            fail_count += 1
+
+        messages = [(entry.get("message") or "") for entry in (op.get("log") or [])]
+        # 429 in log → Deliverect fell back to snooze; otherwise it was a normal listing update.
+        has_rate_limit = any(rate_limit_message in message for message in messages)
+        op_id = op.get("_id")
+
+        if has_rate_limit:
+            snooze_backup.add(op_id)
+            location_id = op.get("location")
+            if location_id:
+                snooze_backup_location_ids.add(location_id)
+            sample_message = next(
+                (message for message in messages if rate_limit_message in message),
+                "",
+            )
+            rate_limited_details.append(
+                {
+                    "_id": op_id,
+                    "location": location_id,
+                    "message": sample_message,
+                }
+            )
+        else:
+            normal_listings.add(op_id)
+
+    total = len(operation_reports)
+    success_rate = (success_count / total * 100) if total else 0
+
+    return {
+        "total": total,
+        "success_count": success_count,
+        "fail_count": fail_count,
+        "success_rate": success_rate,
+        "status_counts": status_counts,
+        "snooze_backup": snooze_backup,
+        "snooze_backup_location_ids": snooze_backup_location_ids,
+        "normal_listings": normal_listings,
+        "rate_limited_details": rate_limited_details,
+    }
 
 
 def get1Location(locationId: str):
