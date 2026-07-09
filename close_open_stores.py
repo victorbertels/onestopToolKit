@@ -24,7 +24,11 @@ KNOWN_CHANNEL_NAMES = {
     6002: "Deliveroo",
     6007: "Uber Eats",
     6009: "Just Eat",
+    10249: "Snappy Shopper",
 }
+
+# Always exclude from close/open (e.g. Deliverect internal channel).
+EXCLUDED_CHANNEL_IDS = {1}
 
 
 def delay_for_action(close_stores: bool) -> int:
@@ -49,11 +53,17 @@ def normalize_locations(raw_locations: list[dict]) -> list[dict]:
 
 
 def normalize_flat_channel_links(raw_links: list[dict]) -> list[dict]:
-    """Map raw channel link docs to {id, name, location, channel}."""
+    """Map raw channel link docs to {id, name, location, channel}.
+
+    Channel IDs in EXCLUDED_CHANNEL_IDS (e.g. Deliverect = 1) are dropped.
+    """
     out = []
     for link in raw_links:
         link_id = link.get("_id") or link.get("id")
         if not link_id:
+            continue
+        channel_id = _normalize_channel_id(link.get("channel"))
+        if channel_id in EXCLUDED_CHANNEL_IDS:
             continue
         out.append(
             {
@@ -78,7 +88,7 @@ def get_channel_groups(flat_links: list[dict]) -> list[dict]:
     by_channel: dict[int, list[str]] = {}
     for link in flat_links:
         channel_id = _normalize_channel_id(link.get("channel"))
-        if channel_id is None:
+        if channel_id is None or channel_id in EXCLUDED_CHANNEL_IDS:
             continue
         by_channel.setdefault(channel_id, []).append(link["id"])
 
