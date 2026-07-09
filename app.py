@@ -26,6 +26,12 @@ from channel_activation import (
     extract_unique_location_tags,
     fetch_activation_data,
 )
+from close_open_stores import (
+    get_unique_location_tags as busy_mode_location_tags,
+    load_account_busy_mode_data,
+    run_busy_mode_for_channel_links,
+    select_channel_links,
+)
 from main import createRetailChannels
 from utils import (
     OPENING_HOURS_CSV_COLUMNS,
@@ -48,6 +54,9 @@ load_dotenv()
 
 ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL", "")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+
+# Close / Open Stores is only available for this OneStop account.
+BUSY_MODE_ALLOWED_ACCOUNT_ID = "6963884edc8e7760066fa547"
 
 CHANNEL_ORDER = ("Just Eat", "Deliveroo", "Uber Eats")
 DEFAULT_WORKERS = 20
@@ -596,6 +605,9 @@ def _sign_out_sidebar() -> None:
             st.session_state.pop("authenticated", None)
             st.session_state.pop("hours_page_tracked", None)
             st.session_state.pop("tool_page_tracked", None)
+            for key in list(st.session_state.keys()):
+                if key.startswith("busy_mode_"):
+                    st.session_state.pop(key, None)
             st.rerun()
 
 
@@ -765,6 +777,285 @@ def page_inventory_sync() -> None:
     _render_inventory_sync_analysis(_get_account_id())
 
 
+def _busy_mode_account_allowed(account_id: str) -> bool:
+    return account_id.strip() == BUSY_MODE_ALLOWED_ACCOUNT_ID
+
+
+def _render_close_open_stores(account_id: str) -> None:
+    if not account_id.strip():
+        st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
+        return
+
+    if not _busy_mode_account_allowed(account_id):
+        st.error(
+            "Close / Open Stores is only available for the configured OneStop account. "
+            f"Current ACCOUNT_ID `{account_id}` is not allowed."
+        )
+        return
+
+    st.markdown(
+        "Set busy mode on **channel links** matching your location and channel selection. "
+        "Close uses preparation delay **999**; open uses **0**."
+    )
+    st.warning(
+        "This changes live store availability. Double-check your selection before proceeding."
+    )
+    st.caption(f"Account: `{account_id}`")
+    st.markdown("---")
+
+    load_col, _ = st.columns([1, 3])
+    with load_col:
+        load_clicked = st.button(
+            "Load locations & channels",
+            key="busy_mode_load",
+        )
+
+    if load_clicked:
+        with st.spinner("Loading account data..."):
+            try:
+                data = load_account_busy_mode_data(account_id)
+            except Exception as exc:
+                st.error(f"Failed to load account data: {exc}")
+                return
+            st.session_state["busy_mode_cached_locations"] = data["locations"]
+            st.session_state["busy_mode_cached_channels"] = data["channel_groups"]
+            st.session_state["busy_mode_cached_channel_links"] = data["flat_channel_links"]
+            st.session_state["busy_mode_cache_account"] = account_id
+
+    cached_account = st.session_state.get("busy_mode_cache_account")
+    locations = st.session_state.get("busy_mode_cached_locations", [])
+    channel_groups = st.session_state.get("busy_mode_cached_channels", [])
+    flat_channel_links = st.session_state.get("busy_mode_cached_channel_links", [])
+
+    if cached_account and cached_account != account_id:
+        st.info("Account changed — click **Load locations & channels** before proceeding.")
+    elif locations or channel_groups:
+        st.caption(
+            f"Loaded **{len(locations)}** locations, **{len(channel_groups)}** channels, "
+            f"**{len(flat_channel_links)}** channel links for account `{cached_account}`."
+        )
+
+    action = st.radio(
+        "Action",
+        options=["Close stores", "Open stores"],
+        horizontal=True,
+        key="busy_mode_action",
+    )
+    close_stores = action == "Close stores"
+
+    st.subheader("1. Locations")
+    location_mode = st.radio(
+        "Which locations?",
+        options=["All locations", "Location groups (tags)", "Selected locations"],
+        horizontal=True,
+        key="busy_mode_location_mode",
+    )
+
+    selected_location_ids = []
+    selected_tags = []
+
+    if location_mode == "Selected locations":
+        location_options = {
+            loc["id"]: f"{loc.get('name') or loc['id']} ({loc['id']})"
+            for loc in locations
+        }
+        selected_location_ids = st.multiselect(
+            "Select locations",
+            options=list(location_options.keys()),
+            format_func=lambda loc_id: location_options.get(loc_id, loc_id),
+            key="busy_mode_locations",
+        )
+    elif location_mode == "Location groups (tags)":
+        all_tags = busy_mode_location_tags(locations)
+        selected_tags = st.multiselect(
+            "Select location groups (tags)",
+            options=all_tags,
+            help="Locations that have any of the selected tags.",
+            key="busy_mode_tags",
+        )
+
+    st.subheader("2. Channels")
+    channel_mode = st.radio(
+        "Which channels?",
+        options=["All channels", "Selected channels"],
+        horizontal=True,
+        key="busy_mode_channel_mode",
+    )
+
+    selected_channel_ids = []
+    if channel_mode == "Selected channels":
+        channel_options = {
+            group["channelId"]: (
+                f"{group.get('channel') or group['channelId']} "
+                f"({len(group.get('channelLinksIds') or [])} links)"
+            )
+            for group in channel_groups
+            if group.get("channelId") is not None
+        }
+        selected_channel_ids = st.multiselect(
+            "Select channels",
+            options=list(channel_options.keys()),
+            format_func=lambda channel_id: channel_options.get(channel_id, str(channel_id)),
+            key="busy_mode_channels",
+        )
+
+    matched_links = []
+    data_ready = bool(cached_account and cached_account == account_id)
+    if data_ready:
+        matched_links = select_channel_links(
+            flat_channel_links,
+            locations,
+            channel_groups,
+            location_mode,
+            selected_location_ids,
+            selected_tags,
+            channel_mode,
+            selected_channel_ids,
+        )
+
+    target_count = len(matched_links)
+    target_label = (
+        f"{target_count} channel link(s) matching your location and channel selection"
+    )
+
+    if not data_ready:
+        st.info(
+            "Load locations and channels for this account to see how many channel links will be updated."
+        )
+    elif not flat_channel_links:
+        st.warning("No channel links were loaded for this account.")
+    elif target_count == 0:
+        st.warning(
+            "No channel links match the current selection. "
+            "Check that you picked locations/tags and channels, or try **All locations** + **All channels**."
+        )
+    else:
+        st.info(f"**{target_count}** channel link(s) will be updated.")
+        if target_count <= 20:
+            preview = [
+                {
+                    "Location": link.get("location_name"),
+                    "Channel": link.get("channel_name"),
+                    "Channel link": link.get("name"),
+                    "Channel link ID": link.get("id"),
+                }
+                for link in matched_links
+            ]
+            st.dataframe(preview, use_container_width=True, hide_index=True)
+
+    max_workers = st.slider(
+        "Parallel requests",
+        min_value=1,
+        max_value=50,
+        value=10,
+        key="busy_mode_max_workers",
+    )
+
+    confirm = st.checkbox(
+        f"I confirm I want to **{'close' if close_stores else 'open'}** {target_label}",
+        key="busy_mode_confirm",
+    )
+
+    execute_disabled = (
+        not data_ready
+        or not flat_channel_links
+        or target_count == 0
+        or not confirm
+    )
+
+    if st.button(
+        f"{'Close' if close_stores else 'Open'} selected targets",
+        type="primary",
+        disabled=execute_disabled,
+        key="busy_mode_run",
+    ):
+        _track_page("OS Close / Open Stores")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        def on_progress(completed, total, row):
+            progress_bar.progress(completed / total if total else 1.0)
+            status_text.text(
+                f"{completed}/{total} — {row.get('target_type')} "
+                f"{row.get('target_name') or row.get('target_id')}"
+            )
+
+        try:
+            with st.spinner(f"{'Closing' if close_stores else 'Opening'}..."):
+                results = run_busy_mode_for_channel_links(
+                    matched_links,
+                    close_stores,
+                    max_workers=max_workers,
+                    on_progress=on_progress,
+                )
+
+            progress_bar.empty()
+            status_text.empty()
+            st.session_state["busy_mode_results"] = results
+            st.session_state["busy_mode_results_account"] = cached_account
+            st.session_state["busy_mode_results_action"] = action
+            success_count = sum(1 for r in results if r.get("success"))
+            st.success(f"Finished: **{success_count}/{len(results)}** succeeded.")
+        except Exception as exc:
+            progress_bar.empty()
+            status_text.empty()
+            st.error(f"Busy mode update failed: {exc}")
+
+    if st.session_state.get("busy_mode_results"):
+        results = st.session_state["busy_mode_results"]
+        display = []
+        for row in results:
+            display.append(
+                {
+                    "Success": row.get("success"),
+                    "Location": row.get("location_name"),
+                    "Channel": row.get("channel_name"),
+                    "Channel link": row.get("target_name"),
+                    "Channel link ID": row.get("target_id"),
+                    "Tags": row.get("tags"),
+                    "Delay": row.get("preparation_time_delay"),
+                    "Status code": row.get("status_code"),
+                    "Error": row.get("error") or "—",
+                }
+            )
+
+        failed_only = st.checkbox("Show failures only", key="busy_mode_failures_only")
+        shown = [r for r in display if not r["Success"]] if failed_only else display
+        st.dataframe(shown, use_container_width=True, hide_index=True)
+
+        safe_account = "".join(
+            c
+            for c in (st.session_state.get("busy_mode_results_account") or "account")
+            if c.isalnum() or c in (" ", "-", "_")
+        ).strip().replace(" ", "_")
+        action_slug = (
+            "close"
+            if st.session_state.get("busy_mode_results_action") == "Close stores"
+            else "open"
+        )
+        csv_buf = StringIO()
+        if shown:
+            writer = csv.DictWriter(csv_buf, fieldnames=list(shown[0].keys()))
+            writer.writeheader()
+            writer.writerows(shown)
+        st.download_button(
+            label="Download results CSV",
+            data=csv_buf.getvalue(),
+            file_name=f"busy_mode_{action_slug}_{safe_account}.csv",
+            mime="text/csv",
+            key="busy_mode_download",
+        )
+
+
+def page_close_open_stores() -> None:
+    if st.session_state.get("tool_page_tracked") != "Close / Open Stores":
+        _track_page("OS Close / Open Stores")
+        st.session_state["tool_page_tracked"] = "Close / Open Stores"
+    st.title("Close / Open Stores")
+    st.caption("Temporarily close or reopen stores via channel-link busy mode.")
+    _render_close_open_stores(_get_account_id())
+
+
 st.set_page_config(
     page_title="Onestop Toolkit",
     layout="wide",
@@ -805,6 +1096,15 @@ pages = {
         st.Page(page_inventory_sync, title="Analysis", icon=":material/inventory_2:"),
     ],
 }
+
+if _busy_mode_account_allowed(_get_account_id()):
+    pages["Store availability"] = [
+        st.Page(
+            page_close_open_stores,
+            title="Close / Open Stores",
+            icon=":material/store:",
+        ),
+    ]
 
 pg = st.navigation(pages, position="sidebar")
 pg.run()
