@@ -697,8 +697,7 @@ def _render_quest_prep(account_id: str) -> None:
     st.markdown(
         "Paste a **destination location ID**. We copy **Just Eat**, **Deliveroo**, and "
         "**Uber Eats** retail channel links from a known-good template site, clear Uber’s "
-        "`storeId`, then create the three links on the new location. "
-        "Template and destination must both belong to the configured account."
+        "`storeId`, then create the three links on the new location."
     )
     st.warning("This creates live channel links in Deliverect.")
     st.caption(f"Account: `{account_id}`")
@@ -954,8 +953,7 @@ def page_inventory_sync() -> None:
 
 def _render_close_open_stores(account_id: str) -> None:
     st.markdown(
-        "Set busy mode on **channel links** matching your location and channel selection. "
-        "Close uses preparation delay **999**; open uses **0**."
+        "Set busy mode on **channel links** matching your location and channel selection."
     )
     st.warning(
         "This changes live store availability. Double-check your selection before proceeding."
@@ -1219,9 +1217,7 @@ def page_close_open_stores() -> None:
 def _render_suspend_stores(account_id: str) -> None:
     st.markdown(
         "Choose **one mode**: update **locations** (each location + all channel links on it), "
-        "or update **channel links only**. "
-        "Locations use string statuses; channel links use integer statuses. "
-        "Not the same as busy-mode close."
+        "or update **channel links only**."
     )
     st.warning(
         "This changes live store status. Double-check the IDs and statuses before proceeding."
