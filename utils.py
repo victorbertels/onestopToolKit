@@ -16,6 +16,14 @@ from zoneinfo import ZoneInfo
 import requests
 from auth import getHeaders
 
+# All Onestop Toolkit tools are limited to this Deliverect account.
+ONESTOP_ALLOWED_ACCOUNT_ID = "6963884edc8e7760066fa547"
+
+
+def is_onestop_account(account_id: str) -> bool:
+    return (account_id or "").strip() == ONESTOP_ALLOWED_ACCOUNT_ID
+
+
 def post_opening_hours_and_update_channels(
     locations: list,
     *,
@@ -706,6 +714,143 @@ def importChannelLinksOpeningHoursCsv(
     return ok, total
 
 
+# Deliverect status values — locations use strings; channel links use ints.
+CHANNEL_LINK_STATUS_INACTIVE = 0
+CHANNEL_LINK_STATUS_SUSPENDED = 1
+CHANNEL_LINK_STATUS_TESTING = 2
+CHANNEL_LINK_STATUS_SUBSCRIBED = 3
+CHANNEL_LINK_STATUS_ONBOARDING = 4
+
+LOCATION_STATUS_SUSPENDED = "SUSPENDED"
+LOCATION_STATUS_SUBSCRIBED = "SUBSCRIBED"
+LOCATION_STATUS_TESTING = "TESTING"
+
+CHANNEL_LINK_STATUS_OPTIONS = (
+    (CHANNEL_LINK_STATUS_INACTIVE, "Inactive (0)"),
+    (CHANNEL_LINK_STATUS_SUSPENDED, "Suspended (1)"),
+    (CHANNEL_LINK_STATUS_TESTING, "Testing (2)"),
+    (CHANNEL_LINK_STATUS_SUBSCRIBED, "Subscribed (3)"),
+    (CHANNEL_LINK_STATUS_ONBOARDING, "Onboarding (4)"),
+)
+
+LOCATION_STATUS_OPTIONS = (
+    LOCATION_STATUS_SUSPENDED,
+    LOCATION_STATUS_SUBSCRIBED,
+    LOCATION_STATUS_TESTING,
+)
+
+# When updating a location, also set its channel links to the matching int status.
+LOCATION_TO_CHANNEL_LINK_STATUS = {
+    LOCATION_STATUS_SUSPENDED: CHANNEL_LINK_STATUS_SUSPENDED,
+    LOCATION_STATUS_SUBSCRIBED: CHANNEL_LINK_STATUS_SUBSCRIBED,
+    LOCATION_STATUS_TESTING: CHANNEL_LINK_STATUS_TESTING,
+}
+
+
+def set_channel_link_status(channel_link_id: str, status: int) -> dict:
+    """
+    PATCH a channel link ``status`` (integer enum).
+    Returns a result dict with success / error details.
+    """
+    link_id = (channel_link_id or "").strip()
+    if not link_id:
+        return {
+            "target_type": "Channel link",
+            "target_id": channel_link_id,
+            "success": False,
+            "error": "Missing channel link ID",
+            "applied_status": status,
+        }
+
+    info = getChannelLink(link_id)
+    if not info:
+        return {
+            "target_type": "Channel link",
+            "target_id": link_id,
+            "success": False,
+            "error": "Failed to fetch channel link",
+            "applied_status": status,
+        }
+
+    etag = info.get("_etag")
+    if not etag:
+        return {
+            "target_type": "Channel link",
+            "target_id": link_id,
+            "success": False,
+            "error": "Missing etag on channel link",
+            "applied_status": status,
+        }
+
+    ok = bool(updateChannelLink(link_id, {"status": int(status)}, etag))
+    return {
+        "target_type": "Channel link",
+        "target_id": link_id,
+        "target_name": info.get("name") or link_id,
+        "location_id": info.get("location"),
+        "success": ok,
+        "error": None if ok else "PATCH channel link failed",
+        "applied_status": status,
+    }
+
+
+def set_location_status(location_id: str, status: str) -> dict:
+    """
+    PATCH a location ``status`` (string enum). Refreshes etag first.
+    Returns a result dict with success / error details.
+    """
+    loc_id = (location_id or "").strip()
+    if not loc_id:
+        return {
+            "target_type": "Location",
+            "target_id": location_id,
+            "success": False,
+            "error": "Missing location ID",
+            "applied_status": status,
+        }
+
+    # Channel link PATCHes can bump the location's etag; always re-fetch before PATCH.
+    fresh = get1Location(loc_id)
+    if not fresh:
+        return {
+            "target_type": "Location",
+            "target_id": loc_id,
+            "success": False,
+            "error": "Failed to fetch location",
+            "applied_status": status,
+        }
+
+    loc_etag = fresh.get("_etag")
+    if not loc_etag:
+        return {
+            "target_type": "Location",
+            "target_id": loc_id,
+            "success": False,
+            "error": "Missing etag on location",
+            "applied_status": status,
+        }
+
+    ok = bool(updateLocation(loc_id, {"status": status}, loc_etag))
+    return {
+        "target_type": "Location",
+        "target_id": loc_id,
+        "target_name": fresh.get("name") or loc_id,
+        "success": ok,
+        "error": None if ok else "PATCH location failed",
+        "applied_status": status,
+    }
+
+
+def suspend_channel_link(channel_link_id: str) -> dict:
+    """PATCH a channel link to suspended status (status=1)."""
+    return set_channel_link_status(channel_link_id, CHANNEL_LINK_STATUS_SUSPENDED)
+
+
+def suspend_location(location_id: str) -> dict:
+    """PATCH a location to status SUSPENDED."""
+    return set_location_status(location_id, LOCATION_STATUS_SUSPENDED)
+
+
 def markLocationAndChannelLinksAsSuspended(locationObject: dict) -> bool:
     """
     PATCH each channel link to suspended, then PATCH the location to SUSPENDED.
@@ -714,38 +859,16 @@ def markLocationAndChannelLinksAsSuspended(locationObject: dict) -> bool:
     if not locationObject:
         return False
 
-    location_payload = {"status": "SUSPENDED"}
-    channel_link_ids = _channel_link_ids_from_location(locationObject)
-
-    channel_updates_ok = True
-    for link_id in channel_link_ids:
-        info = getChannelLink(link_id)
-        if not info:
-            channel_updates_ok = False
-            continue
-        etag = info.get("_etag")
-        if not etag:
-            channel_updates_ok = False
-            continue
-        if not updateChannelLink(link_id, {"status": 1}, etag):
-            channel_updates_ok = False
-
     loc_id = locationObject.get("_id")
     if not loc_id:
         return False
 
-    # Channel link PATCHes can bump the location's etag on the server; the etag from
-    # the original GET is then stale — PATCH location with If-Match often returns 412.
-    fresh = get1Location(loc_id)
-    if not fresh:
-        return False
-    loc_etag = fresh.get("_etag")
-    if not loc_etag:
-        return False
+    channel_updates_ok = True
+    for link_id in _channel_link_ids_from_location(locationObject):
+        if not suspend_channel_link(link_id).get("success"):
+            channel_updates_ok = False
 
-    location_patch_ok = bool(
-        updateLocation(loc_id, location_payload, loc_etag)
-    )
+    location_patch_ok = bool(suspend_location(loc_id).get("success"))
     return channel_updates_ok and location_patch_ok
 
 

@@ -33,7 +33,24 @@ from close_open_stores import (
     select_channel_links,
 )
 from main import createRetailChannels
+from quest_prep import (
+    PARTNER_ORDER as QUEST_PREP_PARTNERS,
+    build_quest_prep_payloads,
+    create_quest_channels,
+    get_template_location_id,
+)
+from suspend_stores import (
+    CHANNEL_LINK_STATUS_LABELS,
+    parse_ids as parse_suspend_ids,
+    run_set_statuses_by_ids,
+)
 from utils import (
+    CHANNEL_LINK_STATUS_OPTIONS,
+    CHANNEL_LINK_STATUS_SUSPENDED,
+    LOCATION_STATUS_OPTIONS,
+    LOCATION_STATUS_SUSPENDED,
+    LOCATION_TO_CHANNEL_LINK_STATUS,
+    ONESTOP_ALLOWED_ACCOUNT_ID,
     OPENING_HOURS_CSV_COLUMNS,
     INVENTORY_SYNC_DEFAULT_CHANNELS,
     INVENTORY_SYNC_DEFAULT_OPERATION_TYPES,
@@ -45,6 +62,7 @@ from utils import (
     getAllOperationReports,
     import_opening_hours_payloads,
     inventory_sync_range_london,
+    is_onestop_account,
     load_opening_hours_import_payloads_from_rows,
     london_now,
     opening_hours_csv_text,
@@ -54,9 +72,6 @@ load_dotenv()
 
 ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL", "")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
-
-# Close / Open Stores is only available for this OneStop account.
-BUSY_MODE_ALLOWED_ACCOUNT_ID = "6963884edc8e7760066fa547"
 
 CHANNEL_ORDER = ("Just Eat", "Deliveroo", "Uber Eats")
 DEFAULT_WORKERS = 20
@@ -598,6 +613,22 @@ def _get_account_id() -> str:
     return (os.getenv("ACCOUNT_ID") or "").strip()
 
 
+def _require_onestop_account() -> str:
+    """Block the app unless ACCOUNT_ID is the OneStop account. Returns the account id."""
+    account_id = _get_account_id()
+    if not account_id:
+        st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
+        st.stop()
+    if not is_onestop_account(account_id):
+        st.error(
+            "Onestop Toolkit only works with the OneStop Deliverect account. "
+            f"Current ACCOUNT_ID `{account_id}` is not allowed "
+            f"(expected `{ONESTOP_ALLOWED_ACCOUNT_ID}`)."
+        )
+        st.stop()
+    return account_id
+
+
 def _sign_out_sidebar() -> None:
     with st.sidebar:
         st.divider()
@@ -636,6 +667,126 @@ def page_channel_activation() -> None:
     st.title("Channel activation emails")
     st.caption("Generate partner emails with store lists and channel link IDs.")
     _render_channel_activation_emails(_get_account_id())
+
+
+def _render_quest_prep(account_id: str) -> None:
+    st.markdown(
+        "Paste a **destination location ID**. We copy **Just Eat**, **Deliveroo**, and "
+        "**Uber Eats** retail channel links from a known-good template site, clear Uber’s "
+        "`storeId`, then create the three links on the new location. "
+        "Template and destination must both belong to the OneStop account."
+    )
+    st.warning("This creates live channel links in Deliverect.")
+    st.caption(f"Account: `{account_id}`")
+
+    default_template = get_template_location_id()
+    template_location_id = st.text_input(
+        "Template location ID (source site)",
+        value=default_template,
+        placeholder="Location that already has correct JE / Deliveroo / Uber retail links",
+        key="quest_prep_template_id",
+        help="Defaults to the known-good OneStop template site. Override if needed.",
+    ).strip()
+
+    destination_location_id = st.text_input(
+        "Destination location ID",
+        placeholder="e.g. 69df3bbc64312ebd0f8b5016",
+        key="quest_prep_destination_id",
+    ).strip()
+
+    inputs_ready = bool(template_location_id and destination_location_id)
+
+    if st.button("Preview channels", disabled=not inputs_ready, key="quest_prep_preview_btn"):
+        with st.spinner("Loading template retail channels…"):
+            preview, error = build_quest_prep_payloads(
+                destination_location_id,
+                template_location_id,
+            )
+        if error or preview is None:
+            st.error(error or "Failed to build preview.")
+            st.session_state.pop("quest_prep_preview", None)
+        else:
+            st.session_state["quest_prep_preview"] = preview
+            st.session_state.pop("quest_prep_results", None)
+
+    preview = st.session_state.get("quest_prep_preview")
+    if not preview:
+        return
+
+    template_loc = preview["template_location"]
+    dest_loc = preview["destination_location"]
+    st.success("Preview ready.")
+    st.markdown(
+        f"**Template:** {template_loc.get('name') or '—'} "
+        f"(`{template_loc.get('id')}`) → "
+        f"**Destination:** {dest_loc.get('name') or '—'} "
+        f"(`{dest_loc.get('id')}`)"
+    )
+
+    rows = []
+    for partner in QUEST_PREP_PARTNERS:
+        meta = preview["templates"].get(partner, {})
+        payload = preview["payloads"].get(partner, {})
+        uber_store = (payload.get("channelSettings") or {}).get("storeId", "")
+        rows.append(
+            {
+                "Partner": partner,
+                "Template link": meta.get("id") or "",
+                "Template name": meta.get("name") or "",
+                "sendToQuest": meta.get("sendToQuest"),
+                "New name": payload.get("name") or "",
+                "Uber storeId": uber_store if partner == "Uber Eats" else "—",
+            }
+        )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.caption(
+        "Uber `storeId` is cleared so the new site is not bound to the template store. "
+        "Partner will provision a new store ID later."
+    )
+
+    with st.expander("Payloads (JSON)"):
+        for partner in QUEST_PREP_PARTNERS:
+            st.subheader(partner)
+            st.json(preview["payloads"].get(partner, {}))
+
+    if st.button("Create channel links", type="primary", key="quest_prep_create_btn"):
+        with st.spinner("Creating Just Eat, Deliveroo, and Uber Eats channel links…"):
+            results = create_quest_channels(preview["payloads"])
+        st.session_state["quest_prep_results"] = results
+
+    results = st.session_state.get("quest_prep_results")
+    if not results:
+        return
+
+    st.subheader("Results")
+    result_rows = [
+        {
+            "Partner": row.get("partner"),
+            "Created OK": "yes" if row.get("success") else "no",
+            "Channel link ID": row.get("channel_link_id") or "",
+            "Name": row.get("name") or "",
+            "Error": row.get("error") or "—",
+        }
+        for row in results
+    ]
+    st.dataframe(result_rows, use_container_width=True, hide_index=True)
+
+    ok = sum(1 for row in results if row.get("success"))
+    if ok == len(results):
+        st.success(f"Created all {ok} retail channel links.")
+    elif ok:
+        st.warning(f"Created {ok} of {len(results)} channel links — check errors above.")
+    else:
+        st.error("No channel links were created.")
+
+
+def page_quest_prep() -> None:
+    if st.session_state.get("tool_page_tracked") != "Quest prep":
+        _track_page("OS Quest Prep")
+        st.session_state["tool_page_tracked"] = "Quest prep"
+    st.title("Quest prep")
+    st.caption("Prep a location for Quest by cloning retail channel links from a template site.")
+    _render_quest_prep(_get_account_id())
 
 
 def _render_inventory_sync_analysis(account_id: str) -> None:
@@ -777,22 +928,7 @@ def page_inventory_sync() -> None:
     _render_inventory_sync_analysis(_get_account_id())
 
 
-def _busy_mode_account_allowed(account_id: str) -> bool:
-    return account_id.strip() == BUSY_MODE_ALLOWED_ACCOUNT_ID
-
-
 def _render_close_open_stores(account_id: str) -> None:
-    if not account_id.strip():
-        st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
-        return
-
-    if not _busy_mode_account_allowed(account_id):
-        st.error(
-            "Close / Open Stores is only available for the configured OneStop account. "
-            f"Current ACCOUNT_ID `{account_id}` is not allowed."
-        )
-        return
-
     st.markdown(
         "Set busy mode on **channel links** matching your location and channel selection. "
         "Close uses preparation delay **999**; open uses **0**."
@@ -1056,12 +1192,238 @@ def page_close_open_stores() -> None:
     _render_close_open_stores(_get_account_id())
 
 
+def _render_suspend_stores(account_id: str) -> None:
+    st.markdown(
+        "Choose **one mode**: update **locations** (each location + all channel links on it), "
+        "or update **channel links only**. "
+        "Locations use string statuses; channel links use integer statuses. "
+        "Not the same as busy-mode close."
+    )
+    st.warning(
+        "This changes live store status. Double-check the IDs and statuses before proceeding."
+    )
+    st.caption(f"Account: `{account_id}`")
+    st.markdown("---")
+
+    mode = st.radio(
+        "What are you updating?",
+        options=("Locations", "Channel links"),
+        horizontal=True,
+        key="suspend_mode",
+        help=(
+            "Locations: set location status, and map that to the matching int status on "
+            "every channel link listed on that location. Channel links: only the IDs you paste."
+        ),
+    )
+    location_mode = mode == "Locations"
+
+    if location_mode:
+        location_status = st.selectbox(
+            "Location status",
+            options=list(LOCATION_STATUS_OPTIONS),
+            index=list(LOCATION_STATUS_OPTIONS).index(LOCATION_STATUS_SUSPENDED),
+            key="suspend_location_status",
+            help="Written to location.status as a string. Matching channel-link ints: "
+            "SUSPENDED→1, SUBSCRIBED→3, TESTING→2.",
+        )
+        channel_link_status = LOCATION_TO_CHANNEL_LINK_STATUS[location_status]
+    else:
+        location_status = LOCATION_STATUS_SUSPENDED
+        channel_labels = [label for _value, label in CHANNEL_LINK_STATUS_OPTIONS]
+        channel_values = [value for value, _label in CHANNEL_LINK_STATUS_OPTIONS]
+        default_channel_index = channel_values.index(CHANNEL_LINK_STATUS_SUSPENDED)
+        channel_label = st.selectbox(
+            "Channel link status",
+            options=channel_labels,
+            index=default_channel_index,
+            key="suspend_channel_status_only",
+            help="Written to channelLink.status as an integer (0–4).",
+        )
+        channel_link_status = channel_values[channel_labels.index(channel_label)]
+
+    if location_mode:
+        ids_raw = st.text_area(
+            "Location IDs",
+            height=160,
+            placeholder="Paste one location `_id` per line",
+            help=(
+                "For each location: set every channel link on that location to the channel "
+                "status above, then set the location status."
+            ),
+            key="suspend_ids",
+        )
+    else:
+        ids_raw = st.text_area(
+            "Channel link IDs",
+            height=160,
+            placeholder="Paste one channel link `_id` per line",
+            help="Only these channel links are updated. Locations are not changed.",
+            key="suspend_ids",
+        )
+
+    ids = parse_suspend_ids(ids_raw)
+    location_ids = ids if location_mode else []
+    channel_link_ids = [] if location_mode else ids
+    target_count = len(ids)
+
+    channel_status_label = CHANNEL_LINK_STATUS_LABELS.get(
+        channel_link_status, channel_link_status
+    )
+    if location_mode:
+        target_label = (
+            f"{len(location_ids)} location(s) → `{location_status}` "
+            f"(+ their channel links → `{channel_status_label}`)"
+            if location_ids
+            else "0 locations"
+        )
+    else:
+        target_label = (
+            f"{len(channel_link_ids)} channel link(s) → `{channel_status_label}`"
+            if channel_link_ids
+            else "0 channel links"
+        )
+
+    if target_count == 0:
+        st.info(
+            "Enter at least one location ID."
+            if location_mode
+            else "Enter at least one channel link ID."
+        )
+    else:
+        st.info(f"Will update **{target_label}**.")
+        preview_rows = [
+            {
+                "Type": "Location" if location_mode else "Channel link",
+                "ID": item_id,
+                "Status": location_status if location_mode else channel_status_label,
+            }
+            for item_id in ids
+        ]
+        if location_mode:
+            st.caption(
+                "Result rows will include each location’s channel links as well "
+                "(one row per link + one row per location)."
+            )
+        if len(preview_rows) <= 40:
+            st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+
+    max_workers = st.slider(
+        "Parallel requests",
+        min_value=1,
+        max_value=50,
+        value=10,
+        key="suspend_max_workers",
+    )
+
+    confirm = st.checkbox(
+        f"I confirm I want to **update status** for {target_label}",
+        key="suspend_confirm",
+    )
+
+    execute_disabled = target_count == 0 or not confirm
+
+    if st.button(
+        "Apply status",
+        type="primary",
+        disabled=execute_disabled,
+        key="suspend_run",
+    ):
+        _track_page("OS Suspend Stores")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        def on_progress(completed, total, row):
+            progress_bar.progress(completed / total if total else 1.0)
+            status_text.text(
+                f"{completed}/{total} — {row.get('target_type')} "
+                f"{row.get('target_name') or row.get('target_id')}"
+            )
+
+        try:
+            with st.spinner("Updating statuses..."):
+                results = run_set_statuses_by_ids(
+                    location_ids=location_ids,
+                    channel_link_ids=channel_link_ids,
+                    location_status=location_status,
+                    channel_link_status=channel_link_status,
+                    account_id=account_id,
+                    also_update_location_channel_links=location_mode,
+                    max_workers=max_workers,
+                    on_progress=on_progress,
+                )
+
+            progress_bar.empty()
+            status_text.empty()
+            st.session_state["suspend_results"] = results
+            st.session_state["suspend_results_account"] = account_id
+            success_count = sum(1 for r in results if r.get("success"))
+            st.success(f"Finished: **{success_count}/{len(results)}** succeeded.")
+        except Exception as exc:
+            progress_bar.empty()
+            status_text.empty()
+            st.error(f"Status update failed: {exc}")
+
+    if st.session_state.get("suspend_results"):
+        results = st.session_state["suspend_results"]
+        display = []
+        for row in results:
+            applied = row.get("applied_status")
+            if row.get("target_type") == "Channel link":
+                applied_label = CHANNEL_LINK_STATUS_LABELS.get(applied, applied)
+            else:
+                applied_label = applied
+            display.append(
+                {
+                    "Success": row.get("success"),
+                    "Type": row.get("target_type"),
+                    "Location": row.get("location_name"),
+                    "Channel": row.get("channel_name"),
+                    "Name": row.get("target_name"),
+                    "ID": row.get("target_id"),
+                    "Applied status": applied_label if applied_label is not None else "—",
+                    "Error": row.get("error") or "—",
+                }
+            )
+
+        failed_only = st.checkbox("Show failures only", key="suspend_failures_only")
+        shown = [r for r in display if not r["Success"]] if failed_only else display
+        st.dataframe(shown, use_container_width=True, hide_index=True)
+
+        safe_account = "".join(
+            c
+            for c in (st.session_state.get("suspend_results_account") or "account")
+            if c.isalnum() or c in (" ", "-", "_")
+        ).strip().replace(" ", "_")
+        csv_buf = StringIO()
+        if shown:
+            writer = csv.DictWriter(csv_buf, fieldnames=list(shown[0].keys()))
+            writer.writeheader()
+            writer.writerows(shown)
+        st.download_button(
+            label="Download results CSV",
+            data=csv_buf.getvalue(),
+            file_name=f"status_update_{safe_account}.csv",
+            mime="text/csv",
+            key="suspend_download",
+        )
+
+
+def page_suspend_stores() -> None:
+    if st.session_state.get("tool_page_tracked") != "Suspend":
+        _track_page("OS Suspend Stores")
+        st.session_state["tool_page_tracked"] = "Suspend"
+    st.title("Set status")
+    st.caption("Set location status (and its links) or channel link status by ID — one mode at a time.")
+    _render_suspend_stores(_get_account_id())
+
+
 st.set_page_config(
     page_title="Onestop Toolkit",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 _require_password()
+_require_onestop_account()
 
 st.markdown(
     """
@@ -1089,22 +1451,30 @@ pages = {
         st.Page(page_opening_hours_export, title="Export", icon=":material/upload:"),
         st.Page(page_opening_hours_import, title="Import", icon=":material/download:"),
     ],
-    "Channel activation": [
+    "Channel setup": [
+        st.Page(
+            page_quest_prep,
+            title="Quest prep",
+            icon=":material/storefront:",
+        ),
         st.Page(page_channel_activation, title="Partner emails", icon=":material/mail:"),
     ],
     "Inventory sync": [
         st.Page(page_inventory_sync, title="Analysis", icon=":material/inventory_2:"),
     ],
-}
-
-if _busy_mode_account_allowed(_get_account_id()):
-    pages["Store availability"] = [
+    "Store availability": [
         st.Page(
             page_close_open_stores,
             title="Close / Open Stores",
             icon=":material/store:",
         ),
-    ]
+        st.Page(
+            page_suspend_stores,
+            title="Set status",
+            icon=":material/block:",
+        ),
+    ],
+}
 
 pg = st.navigation(pages, position="sidebar")
 pg.run()
