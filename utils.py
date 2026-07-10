@@ -1,12 +1,8 @@
-from pathlib import Path
-import sys
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
 import copy
 import csv
 import io
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, time as dt_time, timezone
@@ -16,12 +12,23 @@ from zoneinfo import ZoneInfo
 import requests
 from auth import getHeaders
 
-# All Onestop Toolkit tools are limited to this Deliverect account.
-ONESTOP_ALLOWED_ACCOUNT_ID = "6963884edc8e7760066fa547"
+
+def get_configured_account_id() -> str:
+    """Account ID from ``ACCOUNT_ID`` (``.env`` or Streamlit secrets hydrated into env)."""
+    return (os.getenv("ACCOUNT_ID") or "").strip()
+
+
+def is_configured_account(account_id: str) -> bool:
+    """True when ``account_id`` matches the configured ``ACCOUNT_ID``."""
+    expected = get_configured_account_id()
+    if not expected:
+        return False
+    return (account_id or "").strip() == expected
 
 
 def is_onestop_account(account_id: str) -> bool:
-    return (account_id or "").strip() == ONESTOP_ALLOWED_ACCOUNT_ID
+    """Backward-compatible alias for ``is_configured_account``."""
+    return is_configured_account(account_id)
 
 
 def post_opening_hours_and_update_channels(

@@ -15,16 +15,12 @@ from utils import (
     CHANNEL_LINK_STATUS_SUSPENDED,
     LOCATION_STATUS_OPTIONS,
     LOCATION_STATUS_SUSPENDED,
-    ONESTOP_ALLOWED_ACCOUNT_ID,
     _channel_link_ids_from_location as channel_link_ids_from_location,
     get1Location,
     getChannelLink,
     set_channel_link_status,
     set_location_status,
 )
-
-# Re-export for callers that imported the old name.
-SUSPEND_ALLOWED_ACCOUNT_ID = ONESTOP_ALLOWED_ACCOUNT_ID
 
 CHANNEL_LINK_STATUS_LABELS = {value: label for value, label in CHANNEL_LINK_STATUS_OPTIONS}
 

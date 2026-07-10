@@ -13,13 +13,9 @@ from typing import Any, Optional
 
 import requests
 from auth import getHeaders
-from utils import ONESTOP_ALLOWED_ACCOUNT_ID, get1Location, getChannelLink, is_onestop_account
 
 REQUEST_TIMEOUT = 60
 API_BASE = "https://api.deliverect.io"
-
-# Re-export for callers that imported the old name.
-QUEST_PREP_ALLOWED_ACCOUNT_ID = ONESTOP_ALLOWED_ACCOUNT_ID
 
 # OneStop retail channel backend IDs (not restaurant 2 / 7 / 9).
 RETAIL_CHANNELS = {
@@ -35,6 +31,10 @@ PARTNER_ORDER = ("Just Eat", "Deliveroo", "Uber Eats")
 DEFAULT_QUEST_PREP_TEMPLATE_LOCATION_ID = "6a503e21a4416958f0241fd2"
 
 
+def get_configured_account_id() -> str:
+    return (os.getenv("ACCOUNT_ID") or "").strip()
+
+
 def get_template_location_id() -> str:
     return (
         (os.getenv("QUEST_PREP_TEMPLATE_LOCATION_ID") or "").strip()
@@ -42,22 +42,21 @@ def get_template_location_id() -> str:
     )
 
 
-def is_quest_prep_account_allowed(account_id: str) -> bool:
-    return is_onestop_account(account_id)
-
-
 def _assert_location_on_allowed_account(
     location: dict,
     *,
     label: str,
 ) -> Optional[str]:
-    """Return an error string if ``location`` is not on the OneStop account."""
+    """Return an error string if ``location`` is not on the configured ACCOUNT_ID."""
+    expected = get_configured_account_id()
+    if not expected:
+        return "ACCOUNT_ID is not set in the environment or Streamlit secrets."
     account = (location.get("account") or "").strip()
-    if not is_onestop_account(account):
+    if account != expected:
         loc_id = location.get("_id") or "unknown"
         return (
             f"{label} `{loc_id}` belongs to account `{account or '—'}`, "
-            f"but Quest prep only allows `{ONESTOP_ALLOWED_ACCOUNT_ID}`."
+            f"but this toolkit is configured for `{expected}`."
         )
     return None
 
@@ -66,12 +65,10 @@ def get_channel_link(
     channel_link_id: str,
     headers: Optional[dict] = None,
 ) -> Optional[dict]:
-    if headers is None:
-        result = getChannelLink(channel_link_id)
-        return result if isinstance(result, dict) else None
-
     url = f"{API_BASE}/channelLinks/{channel_link_id}"
-    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    response = requests.get(
+        url, headers=headers or getHeaders(), timeout=REQUEST_TIMEOUT
+    )
     if response.status_code != 200:
         return None
     return response.json()
@@ -81,12 +78,10 @@ def get_location(
     location_id: str,
     headers: Optional[dict] = None,
 ) -> Optional[dict]:
-    if headers is None:
-        result = get1Location(location_id)
-        return result if isinstance(result, dict) else None
-
     url = f"{API_BASE}/locations/{location_id}"
-    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    response = requests.get(
+        url, headers=headers or getHeaders(), timeout=REQUEST_TIMEOUT
+    )
     if response.status_code != 200:
         return None
     return response.json()

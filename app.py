@@ -50,7 +50,6 @@ from utils import (
     LOCATION_STATUS_OPTIONS,
     LOCATION_STATUS_SUSPENDED,
     LOCATION_TO_CHANNEL_LINK_STATUS,
-    ONESTOP_ALLOWED_ACCOUNT_ID,
     OPENING_HOURS_CSV_COLUMNS,
     INVENTORY_SYNC_DEFAULT_CHANNELS,
     INVENTORY_SYNC_DEFAULT_OPERATION_TYPES,
@@ -60,15 +59,45 @@ from utils import (
     fetch_opening_hours_csv_rows,
     getAllLocations,
     getAllOperationReports,
+    get_configured_account_id,
     import_opening_hours_payloads,
     inventory_sync_range_london,
-    is_onestop_account,
     load_opening_hours_import_payloads_from_rows,
     london_now,
     opening_hours_csv_text,
 )
 
 load_dotenv()
+
+_STREAMLIT_SECRET_KEYS = (
+    "ACCOUNT_ID",
+    "CLIENT_ID",
+    "CLIENT_SECRET",
+    "APP_PASSWORD",
+    "ZAPIER_WEBHOOK_URL",
+    "JUST_EAT_API_KEY",
+    "QUEST_PREP_TEMPLATE_LOCATION_ID",
+)
+
+
+def _hydrate_env_from_streamlit_secrets() -> None:
+    """Copy Streamlit secrets into os.environ when the env var is unset."""
+    try:
+        streamlit_secrets = st.secrets
+    except Exception:
+        return
+    for key in _STREAMLIT_SECRET_KEYS:
+        if (os.getenv(key) or "").strip():
+            continue
+        try:
+            value = streamlit_secrets[key]
+        except Exception:
+            continue
+        if value is not None and str(value).strip():
+            os.environ[key] = str(value).strip()
+
+
+_hydrate_env_from_streamlit_secrets()
 
 ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL", "")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
@@ -610,20 +639,15 @@ def _render_opening_hours_import(account_id: str) -> None:
 
 
 def _get_account_id() -> str:
-    return (os.getenv("ACCOUNT_ID") or "").strip()
+    return get_configured_account_id()
 
 
-def _require_onestop_account() -> str:
-    """Block the app unless ACCOUNT_ID is the OneStop account. Returns the account id."""
+def _require_account_id() -> str:
+    """Block the app unless ACCOUNT_ID is configured. Returns the account id."""
     account_id = _get_account_id()
     if not account_id:
-        st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
-        st.stop()
-    if not is_onestop_account(account_id):
         st.error(
-            "Onestop Toolkit only works with the OneStop Deliverect account. "
-            f"Current ACCOUNT_ID `{account_id}` is not allowed "
-            f"(expected `{ONESTOP_ALLOWED_ACCOUNT_ID}`)."
+            "ACCOUNT_ID is not set. Add it to your `.env` file or Streamlit secrets."
         )
         st.stop()
     return account_id
@@ -674,7 +698,7 @@ def _render_quest_prep(account_id: str) -> None:
         "Paste a **destination location ID**. We copy **Just Eat**, **Deliveroo**, and "
         "**Uber Eats** retail channel links from a known-good template site, clear Uber’s "
         "`storeId`, then create the three links on the new location. "
-        "Template and destination must both belong to the OneStop account."
+        "Template and destination must both belong to the configured account."
     )
     st.warning("This creates live channel links in Deliverect.")
     st.caption(f"Account: `{account_id}`")
@@ -1423,7 +1447,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 _require_password()
-_require_onestop_account()
+_require_account_id()
 
 st.markdown(
     """
