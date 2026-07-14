@@ -1,0 +1,4 @@
+[server]
+# Streamlit Cloud / Linux containers often hit the inotify instance limit
+# with watchdog. Disable file watching; redeploy to pick up code changes.
+fileWatcherType = "none"
