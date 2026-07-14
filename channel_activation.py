@@ -28,33 +28,33 @@ PARTNER_ORDER = ("Uber Eats", "Deliveroo", "Just Eat")
 SUBJECT_UBER_EATS = "Uber Eats activation — {cohort} — action by {action_date}"
 
 INTRO_UBER_EATS = """\
-We want to activate Uber Eats for the following sites.
+We want to activate Uber Eats for the sites in the attached CSV.
 Please complete the steps below so stores can go live on {go_live_date}."""
 
 STEPS_UBER_EATS = """\
-1. Link the following sites to feed from INCA.
-2. Stage the following sites to Flooid Retail (Quest) client ID: jHZkWI0jkna2B_ksR825ARRJOU5Vwxvc
+1. Link the sites in the attached CSV to feed from INCA.
+2. Stage those sites to Flooid Retail (Quest) client ID: jHZkWI0jkna2B_ksR825ARRJOU5Vwxvc
 3. Confirm when the INCA linking is done so we can send all the files to the SFTP."""
 
 SUBJECT_DELIVEROO = "Deliveroo activation — {cohort} — action on {action_date}"
 
 INTRO_DELIVEROO = """\
-We want to activate Deliveroo for the following sites.
-Use the channel link IDs below to connect each site on {go_live_date}."""
+We want to activate Deliveroo for the sites in the attached CSV.
+Use the channel link IDs in the CSV to connect each site on {go_live_date}."""
 
 STEPS_DELIVEROO = """\
-1. Please link all the sites below to Quest enabled brand ID : deliverect-onestop-menu-questpicking 
+1. Please link all the sites in the attached CSV to Quest enabled brand ID : deliverect-onestop-menu-questpicking 
 2. Once that is done please let us know so we can update the listing for those sites.
 """
 
 SUBJECT_JUST_EAT = "Just Eat activation — {cohort} — action on {action_date}"
 
 INTRO_JUST_EAT = """\
-We want to activate Just Eat for the following sites.
+We want to activate Just Eat for the sites in the attached CSV.
 Please complete setup for each restaurant before {go_live_date}."""
 
 STEPS_JUST_EAT = """\
-1. By {action_date}, link each Just Eat restaurant below using the Deliverect channel link ID.
+1. By {action_date}, link each Just Eat restaurant in the attached CSV using the Deliverect channel link ID.
 
 2. Please configure them for Quest:
 
@@ -87,7 +87,7 @@ https://api.deliverect.io
 Base URL:
 https://api.deliverect.io
 
-3. Reply confirming activation is complete for all restaurants listed so we can publish the menus."""
+3. Reply confirming activation is complete for all restaurants in the CSV so we can publish the menus."""
 
 PARTNER_EMAIL_TEMPLATES = {
     "Uber Eats": {
@@ -319,21 +319,11 @@ def build_partner_email(
     intro = _fill_template(templates["intro"], **fill)
     steps = _fill_template(templates["steps"], **fill)
 
-    store_count = len(rows)
-    if store_count:
-        stores_section = (
-            f"This batch includes {store_count} store(s). "
-            "Please see the attached CSV for the store list and IDs.\n"
-        )
-    else:
-        stores_section = "There are no stores in this batch.\n"
-
     body_parts = [
         f"Hi {partner} team,\n\n",
         intro + "\n\n",
         "Please follow these steps:\n\n",
-        steps + "\n\n",
-        stores_section,
+        steps + "\n",
     ]
 
     if extra_notes.strip():
@@ -346,7 +336,7 @@ def build_partner_email(
         "partner": partner,
         "subject": subject,
         "body": "".join(body_parts),
-        "store_count": store_count,
+        "store_count": len(rows),
     }
 
 
