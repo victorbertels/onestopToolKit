@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 from datetime import date
-from io import BytesIO
+from io import BytesIO, StringIO
 from typing import Optional
 
 from openpyxl import Workbook
@@ -254,50 +255,43 @@ def activation_channels_excel_bytes(grouped: dict[str, list[dict]]) -> bytes:
 
 
 def activation_channels_excel_filename(cohort_tag: str) -> str:
+    return f"channel_activation_{_cohort_slug(cohort_tag)}.xlsx"
+
+
+def _cohort_slug(cohort_tag: str) -> str:
     slug = cohort_tag.strip().lower().replace(" ", "_").replace("/", "-")
-    slug = "".join(ch for ch in slug if ch.isalnum() or ch in "-_") or "batch"
-    return f"channel_activation_{slug}.xlsx"
+    return "".join(ch for ch in slug if ch.isalnum() or ch in "-_") or "batch"
 
 
-def _markdown_table(headers: list[str], rows: list[list[str]]) -> str:
-    """Plain-text markdown table for email bodies."""
-    if not rows:
-        return "No stores in this batch.\n"
-
-    str_rows = [[str(cell) for cell in row] for row in rows]
-    widths = [len(h) for h in headers]
-    for row in str_rows:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
-
-    def fmt_row(cells: list[str]) -> str:
-        return "| " + " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells)) + " |"
-
-    sep = "| " + " | ".join("-" * w for w in widths) + " |"
-    lines = [fmt_row(headers), sep]
-    lines.extend(fmt_row(row) for row in str_rows)
-    return "\n".join(lines) + "\n"
-
-
-def _format_store_table(rows: list[dict], partner: str) -> str:
+def _partner_csv_headers(partner: str) -> list[str]:
     if partner == "Uber Eats":
-        headers = ["Store name", "Uber Store ID", "Channel link ID"]
-        data = [
-            [
-                row["location_name"],
-                row["partner_ref"] or "—",
-                row["channel_link_id"],
-            ]
-            for row in rows
-        ]
-    else:
-        headers = ["Store name", "Channel link ID"]
-        data = [
-            [row["location_name"], row["channel_link_id"]]
-            for row in rows
-        ]
+        return ["Store name", "Uber Store ID", "Channel link ID"]
+    return ["Store name", "Channel link ID"]
 
-    return _markdown_table(headers, data)
+
+def _partner_csv_row(partner: str, row: dict) -> list[str]:
+    if partner == "Uber Eats":
+        return [
+            row["location_name"],
+            row["partner_ref"] or "",
+            row["channel_link_id"],
+        ]
+    return [row["location_name"], row["channel_link_id"]]
+
+
+def partner_stores_csv_text(partner: str, rows: list[dict]) -> str:
+    """CSV for one partner — same columns as previously listed in the email."""
+    buf = StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(_partner_csv_headers(partner))
+    for row in rows:
+        writer.writerow(_partner_csv_row(partner, row))
+    return buf.getvalue()
+
+
+def partner_stores_csv_filename(partner: str, cohort_tag: str) -> str:
+    partner_slug = partner.lower().replace(" ", "_")
+    return f"{_cohort_slug(cohort_tag)}_{partner_slug}_stores.csv"
 
 
 def build_partner_email(
@@ -325,13 +319,21 @@ def build_partner_email(
     intro = _fill_template(templates["intro"], **fill)
     steps = _fill_template(templates["steps"], **fill)
 
+    store_count = len(rows)
+    if store_count:
+        stores_section = (
+            f"This batch includes {store_count} store(s). "
+            "Please see the attached CSV for the store list and IDs.\n"
+        )
+    else:
+        stores_section = "There are no stores in this batch.\n"
+
     body_parts = [
         f"Hi {partner} team,\n\n",
         intro + "\n\n",
         "Please follow these steps:\n\n",
         steps + "\n\n",
-        "Stores in this batch:\n\n",
-        _format_store_table(rows, partner),
+        stores_section,
     ]
 
     if extra_notes.strip():
@@ -344,7 +346,7 @@ def build_partner_email(
         "partner": partner,
         "subject": subject,
         "body": "".join(body_parts),
-        "store_count": len(rows),
+        "store_count": store_count,
     }
 
 

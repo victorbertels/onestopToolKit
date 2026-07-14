@@ -25,6 +25,8 @@ from channel_activation import (
     build_all_partner_emails,
     extract_unique_location_tags,
     fetch_activation_data,
+    partner_stores_csv_filename,
+    partner_stores_csv_text,
 )
 from close_open_stores import (
     get_unique_location_tags as busy_mode_location_tags,
@@ -157,8 +159,8 @@ def _require_password() -> None:
 def _render_channel_activation_emails(account_id: str) -> None:
     st.markdown(
         "Build partner-specific emails for **Uber Eats**, **Deliveroo**, and **Just Eat** "
-        "using locations filtered by tag. Each email lists the stores and IDs the partner "
-        "needs to activate."
+        "using locations filtered by tag. Each email asks the partner to activate from an "
+        "attached CSV of store names and IDs."
     )
 
     go_live_date = st.date_input(
@@ -228,7 +230,10 @@ def _render_channel_activation_emails(account_id: str) -> None:
 
         st.divider()
         st.subheader("Generated emails")
-        st.caption("Copy the subject and body below, download partner emails, or export channel data to Excel.")
+        st.caption(
+            "Copy the subject and body below, download the per-partner CSV to attach, "
+            "or export all channel data to Excel."
+        )
 
         summary_cols = st.columns(len(PARTNER_ORDER))
         for idx, partner in enumerate(PARTNER_ORDER):
@@ -259,13 +264,26 @@ def _render_channel_activation_emails(account_id: str) -> None:
                     height=420,
                     key=f"activation_body_{partner}",
                 )
-                st.download_button(
-                    label=f"Download {partner} email",
-                    data=email["body"].encode("utf-8"),
-                    file_name=f"{partner.lower().replace(' ', '_')}_activation.txt",
-                    mime="text/plain",
-                    key=f"activation_download_{partner}",
-                )
+                download_cols = st.columns(2)
+                with download_cols[0]:
+                    st.download_button(
+                        label=f"Download {partner} CSV",
+                        data=partner_stores_csv_text(
+                            partner, grouped.get(partner) or []
+                        ),
+                        file_name=partner_stores_csv_filename(partner, cohort),
+                        mime="text/csv",
+                        type="primary",
+                        key=f"activation_csv_{partner}",
+                    )
+                with download_cols[1]:
+                    st.download_button(
+                        label=f"Download {partner} email",
+                        data=email["body"].encode("utf-8"),
+                        file_name=f"{partner.lower().replace(' ', '_')}_activation.txt",
+                        mime="text/plain",
+                        key=f"activation_download_{partner}",
+                    )
 
 
 def _parse_location_ids(raw: str) -> list:
@@ -689,7 +707,7 @@ def page_channel_activation() -> None:
         _track_page("OS Channel Activation")
         st.session_state["tool_page_tracked"] = "Channel activation emails"
     st.title("Channel activation emails")
-    st.caption("Generate partner emails with store lists and channel link IDs.")
+    st.caption("Generate partner emails with a downloadable CSV of store IDs to attach.")
     _render_channel_activation_emails(_get_account_id())
 
 

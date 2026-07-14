@@ -12,6 +12,8 @@ from channel_activation import (
     build_all_partner_emails,
     extract_unique_location_tags,
     fetch_activation_data,
+    partner_stores_csv_filename,
+    partner_stores_csv_text,
 )
 from utils import getAllLocations
 
@@ -81,7 +83,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         default="",
-        help="Optional folder to save one .txt file per partner email",
+        help="Optional folder to save one .txt email and .csv store list per partner",
     )
     args = parser.parse_args()
     account = _resolve_account_id(args.account)
@@ -153,6 +155,12 @@ def main():
                 f.write(f"Subject: {email['subject']}\n\n")
                 f.write(email["body"])
             print(f"\nSaved to {filepath}")
+
+            csv_name = partner_stores_csv_filename(partner, args.tag.strip())
+            csv_path = os.path.join(args.output_dir, csv_name)
+            with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                f.write(partner_stores_csv_text(partner, rows))
+            print(f"Saved CSV to {csv_path}")
 
 
 if __name__ == "__main__":
