@@ -12,6 +12,7 @@ import re
 import secrets
 from datetime import date, datetime, time, timezone
 from io import StringIO
+from pathlib import Path
 from typing import Optional
 
 import requests as _requests
@@ -33,6 +34,12 @@ from close_open_stores import (
     load_account_busy_mode_data,
     run_busy_mode_for_channel_links,
     select_channel_links,
+)
+from je_cancelled_courier_export import (
+    DEFAULT_DAYS as JE_CANCELLED_DEFAULT_DAYS,
+    JUST_EAT_CHANNELS,
+    MAX_ORDER_LOOKBACK_DAYS as JE_CANCELLED_MAX_DAYS,
+    run_je_cancelled_courier_export,
 )
 from main import createRetailChannels
 from quest_prep import (
@@ -71,6 +78,13 @@ from utils import (
 
 load_dotenv()
 
+# Must be the first Streamlit command — before st.secrets / session_state / widgets.
+st.set_page_config(
+    page_title="Onestop Toolkit",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
 _STREAMLIT_SECRET_KEYS = (
     "ACCOUNT_ID",
     "CLIENT_ID",
@@ -82,8 +96,23 @@ _STREAMLIT_SECRET_KEYS = (
 )
 
 
+def _streamlit_secrets_file_exists() -> bool:
+    """Avoid touching st.secrets (and its warnings) when no secrets.toml is present."""
+    candidates = (
+        Path(__file__).resolve().parent / ".streamlit" / "secrets.toml",
+        Path.cwd() / ".streamlit" / "secrets.toml",
+        Path.home() / ".streamlit" / "secrets.toml",
+    )
+    return any(path.is_file() for path in candidates)
+
+
 def _hydrate_env_from_streamlit_secrets() -> None:
-    """Copy Streamlit secrets into os.environ when the env var is unset."""
+    """Copy Streamlit secrets into os.environ when the env var is unset.
+
+    Local runs typically use `.env` via load_dotenv(); Streamlit Cloud uses secrets.toml.
+    """
+    if not _streamlit_secrets_file_exists():
+        return
     try:
         streamlit_secrets = st.secrets
     except Exception:
@@ -679,7 +708,7 @@ def _sign_out_sidebar() -> None:
             st.session_state.pop("hours_page_tracked", None)
             st.session_state.pop("tool_page_tracked", None)
             for key in list(st.session_state.keys()):
-                if key.startswith("busy_mode_"):
+                if key.startswith("busy_mode_") or key.startswith("je_cancelled_"):
                     st.session_state.pop(key, None)
             st.rerun()
 
@@ -967,6 +996,174 @@ def page_inventory_sync() -> None:
     st.title("Inventory sync")
     st.caption("Deliveroo inventory sync operation reports by location.")
     _render_inventory_sync_analysis(_get_account_id())
+
+
+def _render_je_cancelled_courier_export(account_id: str) -> None:
+    if not account_id:
+        st.error("ACCOUNT_ID is not configured. Set it in the environment or vault.")
+        st.stop()
+
+    st.markdown(
+        "Export **Just Eat cancelled orders** with the **last courier update status**. "
+        "Choose how many days to look back — default is **7** for a weekly run."
+    )
+    st.caption(f"Account: `{account_id}` · Channels: `{JUST_EAT_CHANNELS}`")
+
+    preset = st.radio(
+        "Lookback",
+        options=["1 day", "3 days", "7 days", "14 days", "30 days", "Custom"],
+        index=2,
+        horizontal=True,
+        key="je_cancelled_lookback_preset",
+    )
+    preset_days = {
+        "1 day": 1,
+        "3 days": 3,
+        "7 days": 7,
+        "14 days": 14,
+        "30 days": 30,
+    }
+    if preset == "Custom":
+        days = st.number_input(
+            "Custom lookback (days)",
+            min_value=1,
+            max_value=JE_CANCELLED_MAX_DAYS,
+            value=JE_CANCELLED_DEFAULT_DAYS,
+            step=1,
+            key="je_cancelled_days",
+            help=f"Rolling UTC window ending now (max {JE_CANCELLED_MAX_DAYS} days — API limit).",
+        )
+    else:
+        days = preset_days[preset]
+        st.caption(
+            f"Window: last **{days}** day(s) (UTC, ending now). "
+            f"Max supported: {JE_CANCELLED_MAX_DAYS} days."
+        )
+    filter_interest = st.checkbox(
+        "Show only fraud-interest rows in the preview table",
+        value=False,
+        key="je_cancelled_filter_interest",
+        help=(
+            "CSV always contains all cancelled orders. "
+            "This only filters the on-screen preview."
+        ),
+    )
+
+    filter_key = f"{account_id}|{int(days)}"
+    if st.button("Run export", type="primary", key="je_cancelled_run"):
+        progress = st.progress(0.0, text="Starting export…")
+        status = st.empty()
+        messages: list[str] = []
+
+        def on_progress(msg: str) -> None:
+            messages.append(msg)
+            status.caption(msg)
+            # Indeterminate-ish progress based on message count
+            progress.progress(min(0.95, 0.1 + 0.05 * len(messages)), text=msg)
+
+        try:
+            result = run_je_cancelled_courier_export(
+                account_id,
+                days=int(days),
+                progress_callback=on_progress,
+            )
+        except Exception as exc:
+            progress.empty()
+            st.error(f"Export failed: {exc}")
+            st.stop()
+
+        progress.progress(1.0, text="Done")
+        st.session_state["je_cancelled_result"] = {
+            "filter_key": filter_key,
+            "result": result,
+        }
+
+    cached = st.session_state.get("je_cancelled_result")
+    if not cached:
+        return
+
+    if cached.get("filter_key") != filter_key:
+        st.info("Lookback changed — click **Run export** to refresh.")
+        return
+
+    result = cached["result"]
+    summary = result["summary"]
+    rows = result["rows"]
+
+    st.subheader(
+        f"Results — last {result['days']} day(s) · "
+        f"{result['since'][:10]} → {result['until'][:10]} UTC"
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cancelled orders", summary["orderCount"])
+    c2.metric("Fraud-interest last courier status", summary["fraudInterestCount"])
+    none_count = summary["lastCourierStatusBreakdown"].get("(none)", 0)
+    c3.metric("No courier updates", none_count)
+
+    breakdown = summary.get("lastCourierStatusBreakdown") or {}
+    if breakdown:
+        st.markdown("**Last courier status breakdown**")
+        st.dataframe(
+            [
+                {"Last courier status": label, "Count": count}
+                for label, count in breakdown.items()
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.download_button(
+        "Download CSV",
+        data=result["csv"].encode("utf-8-sig"),
+        file_name=result["filename"],
+        mime="text/csv",
+        key="je_cancelled_download",
+        type="primary",
+    )
+
+    preview_rows = rows
+    if filter_interest:
+        preview_rows = [
+            r
+            for r in rows
+            if r.get(
+                "Courier fraud interest (arrived pickup / en-route dropoff / delivered)"
+            )
+            == "Y"
+        ]
+        st.caption(f"Previewing {len(preview_rows):,} fraud-interest rows of {len(rows):,}.")
+
+    if not preview_rows:
+        st.info("No rows to preview for the current filter.")
+        return
+
+    preview_cols = [
+        "Created (UTC)",
+        "Location",
+        "Channel order display ID",
+        "Channel order ID",
+        "Total",
+        "Last courier status",
+        "Last courier update (UTC)",
+        "Courier fraud interest (arrived pickup / en-route dropoff / delivered)",
+        "Note",
+    ]
+    st.dataframe(
+        [{k: r.get(k, "") for k in preview_cols} for r in preview_rows[:500]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    if len(preview_rows) > 500:
+        st.caption("Preview limited to the first 500 rows — download the CSV for the full export.")
+
+
+def page_je_cancelled_courier_export() -> None:
+    if st.session_state.get("tool_page_tracked") != "JE cancelled courier":
+        _track_page("OS JE Cancelled Courier Export")
+        st.session_state["tool_page_tracked"] = "JE cancelled courier"
+    st.title("Just Eat cancelled orders")
+    st.caption("Weekly-friendly export of cancelled JE orders + last courier status.")
+    _render_je_cancelled_courier_export(_get_account_id())
 
 
 def _render_close_open_stores(account_id: str) -> None:
@@ -1455,11 +1652,6 @@ def page_suspend_stores() -> None:
     _render_suspend_stores(_get_account_id())
 
 
-st.set_page_config(
-    page_title="Onestop Toolkit",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 _require_password()
 _require_account_id()
 
@@ -1499,6 +1691,13 @@ pages = {
     ],
     "Inventory sync": [
         st.Page(page_inventory_sync, title="Analysis", icon=":material/inventory_2:"),
+    ],
+    "Orders": [
+        st.Page(
+            page_je_cancelled_courier_export,
+            title="JE cancelled courier",
+            icon=":material/local_shipping:",
+        ),
     ],
     "Store availability": [
         st.Page(
