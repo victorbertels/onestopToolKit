@@ -139,7 +139,7 @@ PREVIEW_ROWS = 100
 
 
 def _track_page(page_name: str):
-    """Fire-and-forget POST to Zapier with the page the user visited."""
+    """Fire-and-forget POST to Zapier when a user runs a script action."""
     if not ZAPIER_WEBHOOK_URL:
         return
     try:
@@ -153,13 +153,6 @@ def _track_page(page_name: str):
         )
     except Exception:
         pass
-
-
-def _track_hours_page(page: str) -> None:
-    page_name = "OS Export" if page == "Export" else "OS Import"
-    if st.session_state.get("hours_page_tracked") != page:
-        _track_page(page_name)
-        st.session_state["hours_page_tracked"] = page
 
 
 def _require_password() -> None:
@@ -416,6 +409,7 @@ def _render_retail_channels(account_id: str) -> None:
             st.error("Enter at least one location ID.")
             st.stop()
 
+        _track_page("OS Create Retail Channels")
         log_lines = []
         log_container = st.empty()
 
@@ -503,6 +497,7 @@ def _render_opening_hours_export(account_id: str) -> None:
         if not account_id.strip():
             st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
         else:
+            _track_page("OS Export")
             progress_bar = st.progress(0.0, text="Starting export…")
             status = st.empty()
 
@@ -646,6 +641,7 @@ def _render_opening_hours_import(account_id: str) -> None:
             if not account_id.strip():
                 st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
             else:
+                _track_page("OS Import")
                 payloads = st.session_state["hours_import_payloads"]
                 progress = st.progress(0.0, text="Starting import…")
                 status = st.empty()
@@ -705,8 +701,6 @@ def _sign_out_sidebar() -> None:
         st.divider()
         if st.button("Sign out", key="sign_out", use_container_width=True):
             st.session_state.pop("authenticated", None)
-            st.session_state.pop("hours_page_tracked", None)
-            st.session_state.pop("tool_page_tracked", None)
             for key in list(st.session_state.keys()):
                 if key.startswith("busy_mode_") or key.startswith("je_cancelled_"):
                     st.session_state.pop(key, None)
@@ -718,7 +712,6 @@ def page_opening_hours_export() -> None:
     st.caption(
         "Export channel link opening hours to CSV, edit in Excel, then import back using the same format."
     )
-    _track_hours_page("Export")
     _render_opening_hours_export(_get_account_id())
 
 
@@ -727,14 +720,10 @@ def page_opening_hours_import() -> None:
     st.caption(
         "Export channel link opening hours to CSV, edit in Excel, then import back using the same format."
     )
-    _track_hours_page("Import")
     _render_opening_hours_import(_get_account_id())
 
 
 def page_channel_activation() -> None:
-    if st.session_state.get("tool_page_tracked") != "Channel activation emails":
-        _track_page("OS Channel Activation")
-        st.session_state["tool_page_tracked"] = "Channel activation emails"
     st.title("Channel activation emails")
     st.caption("Generate partner emails with a downloadable CSV of store IDs to attach.")
     _render_channel_activation_emails(_get_account_id())
@@ -820,6 +809,7 @@ def _render_quest_prep(account_id: str) -> None:
             st.json(preview["payloads"].get(partner, {}))
 
     if st.button("Create channel links", type="primary", key="quest_prep_create_btn"):
+        _track_page("OS Quest Prep")
         with st.spinner("Creating Just Eat, Deliveroo, and Uber Eats channel links…"):
             results = create_quest_channels(preview["payloads"])
         st.session_state["quest_prep_results"] = results
@@ -851,9 +841,6 @@ def _render_quest_prep(account_id: str) -> None:
 
 
 def page_quest_prep() -> None:
-    if st.session_state.get("tool_page_tracked") != "Quest prep":
-        _track_page("OS Quest Prep")
-        st.session_state["tool_page_tracked"] = "Quest prep"
     st.title("Quest prep")
     st.caption("Prep a location for Quest by cloning retail channel links from a template site.")
     _render_quest_prep(_get_account_id())
@@ -920,6 +907,7 @@ def _render_inventory_sync_analysis(account_id: str) -> None:
             st.error("Select at least one operation type and one channel.")
             st.stop()
 
+        _track_page("OS Inventory Sync")
         with st.spinner("Fetching operation reports and locations…"):
             try:
                 reports = getAllOperationReports(
@@ -990,9 +978,6 @@ def _render_inventory_sync_analysis(account_id: str) -> None:
 
 
 def page_inventory_sync() -> None:
-    if st.session_state.get("tool_page_tracked") != "Inventory sync":
-        _track_page("OS Inventory Sync")
-        st.session_state["tool_page_tracked"] = "Inventory sync"
     st.title("Inventory sync")
     st.caption("Deliveroo inventory sync operation reports by location.")
     _render_inventory_sync_analysis(_get_account_id())
@@ -1051,6 +1036,7 @@ def _render_je_cancelled_courier_export(account_id: str) -> None:
 
     filter_key = f"{account_id}|{int(days)}"
     if st.button("Run export", type="primary", key="je_cancelled_run"):
+        _track_page("OS JE Cancelled Courier Export")
         progress = st.progress(0.0, text="Starting export…")
         status = st.empty()
         messages: list[str] = []
@@ -1158,9 +1144,6 @@ def _render_je_cancelled_courier_export(account_id: str) -> None:
 
 
 def page_je_cancelled_courier_export() -> None:
-    if st.session_state.get("tool_page_tracked") != "JE cancelled courier":
-        _track_page("OS JE Cancelled Courier Export")
-        st.session_state["tool_page_tracked"] = "JE cancelled courier"
     st.title("Just Eat cancelled orders")
     st.caption("Weekly-friendly export of cancelled JE orders + last courier status.")
     _render_je_cancelled_courier_export(_get_account_id())
@@ -1421,9 +1404,6 @@ def _render_close_open_stores(account_id: str) -> None:
 
 
 def page_close_open_stores() -> None:
-    if st.session_state.get("tool_page_tracked") != "Close / Open Stores":
-        _track_page("OS Close / Open Stores")
-        st.session_state["tool_page_tracked"] = "Close / Open Stores"
     st.title("Close / Open Stores")
     st.caption("Temporarily close or reopen stores via channel-link busy mode.")
     _render_close_open_stores(_get_account_id())
@@ -1644,9 +1624,6 @@ def _render_suspend_stores(account_id: str) -> None:
 
 
 def page_suspend_stores() -> None:
-    if st.session_state.get("tool_page_tracked") != "Suspend":
-        _track_page("OS Suspend Stores")
-        st.session_state["tool_page_tracked"] = "Suspend"
     st.title("Set status")
     st.caption("Set location status (and its links) or channel link status by ID — one mode at a time.")
     _render_suspend_stores(_get_account_id())
