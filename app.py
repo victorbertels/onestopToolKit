@@ -44,7 +44,6 @@ from je_cancelled_courier_export import (
 from main import createRetailChannels
 from retry_failed_orders import (
     BATCH_SIZE as RETRY_BATCH_SIZE,
-    DEFAULT_STATUSES as RETRY_FAILED_STATUSES,
     MAX_WORKERS as RETRY_MAX_WORKERS,
     SLEEP_SECONDS as RETRY_SLEEP_SECONDS,
     cancel_retry_job,
@@ -1168,8 +1167,7 @@ def _render_retry_failed_orders(account_id: str) -> None:
         st.stop()
 
     st.markdown(
-        "Find orders in failed statuses "
-        f"(`{RETRY_FAILED_STATUSES}`) and retry them via "
+        "Find orders in failed status **122** and retry them via "
         "`GET /retry/{{orderId}}` with **X-Deliverect-Version: retail**."
     )
     st.caption(f"Account: `{account_id}`")
