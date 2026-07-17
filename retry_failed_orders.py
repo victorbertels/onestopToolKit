@@ -1,10 +1,13 @@
 """Retry failed Deliverect retail orders via GET /retry/{orderId}.
 
-Finds orders in failed status 122 for an account + time window, then
+Finds orders in failed statuses 120 / 122 for an account + time window, then
 retries each through the retail retry endpoint.
 
-Order listing uses a minimal ``_id`` projection and sequential paging so large
-days do not time out or OOM.
+Orders that already have Manual Retry (123) in ``statusHistory`` are skipped
+so we do not re-send previously retried orders.
+
+Order listing uses a lean projection and sequential paging so large days do
+not time out or OOM.
 """
 
 from __future__ import annotations
@@ -29,9 +32,11 @@ from utils import inventory_sync_created_range_for_date, london_now
 API_BASE = "https://api.deliverect.io"
 RETRY_BASE = f"{API_BASE}/retry"
 
-# Deliverect failed-order status for retail retry.
-FAILED_STATUSES = [122]
+# Deliverect failed-order statuses for retail retry.
+FAILED_STATUSES = [120, 122]
 DEFAULT_STATUSES = list(FAILED_STATUSES)
+# Manual Retry — if this appears in statusHistory, do not retry again.
+SKIP_IF_HISTORY_STATUS = 123
 
 PAGE_SIZE = 500
 BATCH_SIZE = 1000
@@ -40,12 +45,17 @@ SLEEP_SECONDS = 60
 REQUEST_TIMEOUT = 120
 MAX_ORDER_LOOKBACK_DAYS = 89
 
-# Keep listing payloads tiny — full order docs OOM / time out on large days.
-ORDER_ID_PROJECTION = {"_id": 1}
+# Lean listing projection — need statusHistory to skip already-retried orders.
+ORDER_LIST_PROJECTION = {
+    "_id": 1,
+    "status": 1,
+    "statusHistory": 1,
+}
 ORDER_PREVIEW_PROJECTION = {
     "_id": 1,
     "_created": 1,
     "status": 1,
+    "statusHistory": 1,
     "channelOrderDisplayId": 1,
     "location": 1,
     "channel": 1,
@@ -107,6 +117,25 @@ def _retail_headers() -> dict:
     return headers
 
 
+def order_has_history_status(
+    order: dict,
+    status: int = SKIP_IF_HISTORY_STATUS,
+) -> bool:
+    """True if ``statusHistory`` contains an entry with the given status code."""
+    history = order.get("statusHistory") or []
+    if not isinstance(history, list):
+        return False
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            if int(entry.get("status")) == status:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _fetch_orders_page(
     account: str,
     *,
@@ -122,7 +151,7 @@ def _fetch_orders_page(
         "status": {"$in": statuses},
         "_created": {"$gt": since, "$lt": until},
     }
-    proj = projection if projection is not None else ORDER_ID_PROJECTION
+    proj = projection if projection is not None else ORDER_LIST_PROJECTION
     params = (
         f"where={quote(json.dumps(where, separators=(',', ':')))}"
         f"&projection={quote(json.dumps(proj, separators=(',', ':')))}"
@@ -145,7 +174,7 @@ def fetch_failed_order_ids(
     statuses: Optional[list[int]] = None,
     progress_callback: ProgressCallback = None,
 ) -> list[str]:
-    """Fetch failed order ``_id`` values only (minimal projection, sequential pages)."""
+    """Fetch failed order IDs, skipping any with Manual Retry (123) in history."""
     statuses = list(statuses or DEFAULT_STATUSES)
 
     def log(msg: str) -> None:
@@ -158,26 +187,33 @@ def fetch_failed_order_ids(
         until=until,
         statuses=statuses,
         page=1,
-        projection=ORDER_ID_PROJECTION,
+        projection=ORDER_LIST_PROJECTION,
     )
     meta = page1.get("_meta") or {}
     total = int(meta.get("total") or 0)
     max_results = int(meta.get("max_results") or PAGE_SIZE)
     pages = max(1, (total + max_results - 1) // max_results) if total else 1
     log(
-        f"Found {total:,} failed order(s) — fetching IDs only "
-        f"({pages} page(s), projection=_id)"
+        f"Found {total:,} failed order(s) (status {statuses}) — "
+        f"fetching with status/statusHistory ({pages} page(s))"
     )
 
     ids: list[str] = []
     seen: set[str] = set()
+    skipped_manual_retry = 0
 
     def _take(items: list) -> None:
+        nonlocal skipped_manual_retry
         for item in items:
-            oid = item.get("_id") if isinstance(item, dict) else None
+            if not isinstance(item, dict):
+                continue
+            oid = item.get("_id")
             if not oid or oid in seen:
                 continue
             seen.add(oid)
+            if order_has_history_status(item, SKIP_IF_HISTORY_STATUS):
+                skipped_manual_retry += 1
+                continue
             ids.append(oid)
 
     _take(page1.get("_items") or [])
@@ -191,13 +227,20 @@ def fetch_failed_order_ids(
             statuses=statuses,
             page=page,
             max_results=max_results,
-            projection=ORDER_ID_PROJECTION,
+            projection=ORDER_LIST_PROJECTION,
         )
         _take(data.get("_items") or [])
         if page % 10 == 0 or page == pages:
-            log(f"Fetched ID page {page}/{pages} ({len(ids):,} unique so far)")
+            log(
+                f"Fetched page {page}/{pages} "
+                f"({len(ids):,} to retry, {skipped_manual_retry:,} skipped "
+                f"with history status {SKIP_IF_HISTORY_STATUS})"
+            )
 
-    log(f"Loaded {len(ids):,} unique order ID(s)")
+    log(
+        f"Loaded {len(ids):,} order ID(s) to retry "
+        f"(skipped {skipped_manual_retry:,} already manually retried / status {SKIP_IF_HISTORY_STATUS} in history)"
+    )
     return ids
 
 
@@ -212,7 +255,7 @@ def fetch_failed_orders(
 ) -> list[dict]:
     """Fetch failed orders.
 
-    Default: ``_id``-only projection (wraps ``fetch_failed_order_ids``).
+    Default: lean projection + skip history-123 (wraps ``fetch_failed_order_ids``).
     ``preview=True``: small field set for UI tables (still sequential pages).
     """
     if not preview:
@@ -248,10 +291,15 @@ def fetch_failed_orders(
     log(f"Found {total:,} failed order(s) — preview fields ({pages} page(s))")
 
     by_id: dict[str, dict] = {}
+    skipped_manual_retry = 0
     for item in page1.get("_items") or []:
         oid = item.get("_id")
-        if oid:
-            by_id[oid] = item
+        if not oid:
+            continue
+        if order_has_history_status(item, SKIP_IF_HISTORY_STATUS):
+            skipped_manual_retry += 1
+            continue
+        by_id[oid] = item
 
     for page in range(2, pages + 1):
         data = _fetch_orders_page(
@@ -265,10 +313,17 @@ def fetch_failed_orders(
         )
         for item in data.get("_items") or []:
             oid = item.get("_id")
-            if oid:
-                by_id[oid] = item
+            if not oid:
+                continue
+            if order_has_history_status(item, SKIP_IF_HISTORY_STATUS):
+                skipped_manual_retry += 1
+                continue
+            by_id[oid] = item
         if page % 10 == 0 or page == pages:
-            log(f"Fetched preview page {page}/{pages} ({len(by_id):,} unique)")
+            log(
+                f"Fetched preview page {page}/{pages} "
+                f"({len(by_id):,} unique, {skipped_manual_retry:,} skipped)"
+            )
 
     return list(by_id.values())
 
@@ -696,7 +751,7 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(
         description=(
-            "List failed retail orders (status 122) and retry them via "
+            "List failed retail orders (status 120/122) and retry them via "
             "GET /retry/{orderId} with X-Deliverect-Version: retail."
         )
     )

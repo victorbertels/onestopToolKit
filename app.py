@@ -1167,8 +1167,9 @@ def _render_retry_failed_orders(account_id: str) -> None:
         st.stop()
 
     st.markdown(
-        "Find orders in failed status **122** and retry them via "
-        "`GET /retry/{{orderId}}` with **X-Deliverect-Version: retail**."
+        "Find orders in failed statuses **120 / 122** and retry them via "
+        "`GET /retry/{{orderId}}` with **X-Deliverect-Version: retail**. "
+        "Orders that already have **123** (Manual Retry) in `statusHistory` are skipped."
     )
     st.caption(f"Account: `{account_id}`")
     st.warning("This re-pushes live orders to the POS. Preview first, then confirm.")
@@ -1391,7 +1392,7 @@ def _render_retry_failed_job(job_id: str) -> None:
 
 def page_retry_failed_orders() -> None:
     st.title("Retry failed orders")
-    st.caption("Retail retry for failed POS orders (status 122).")
+    st.caption("Retail retry for failed POS orders (status 120 / 122).")
     _render_retry_failed_orders(_get_account_id())
 
 
