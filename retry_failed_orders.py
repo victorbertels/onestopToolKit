@@ -32,6 +32,9 @@ from utils import inventory_sync_created_range_for_date, london_now
 API_BASE = "https://api.deliverect.io"
 RETRY_BASE = f"{API_BASE}/retry"
 
+# Bump when Cloud mounts look stale — Streamlit UI shows this version.
+MODULE_VERSION = "2026-07-17-retry-v3"
+
 # Deliverect failed-order statuses for retail retry.
 FAILED_STATUSES = [120, 122]
 DEFAULT_STATUSES = list(FAILED_STATUSES)

@@ -42,25 +42,7 @@ from je_cancelled_courier_export import (
     run_je_cancelled_courier_export,
 )
 from main import createRetailChannels
-from retry_failed_orders import (
-    BATCH_SIZE as RETRY_BATCH_SIZE,
-    MAX_WORKERS as RETRY_MAX_WORKERS,
-    SLEEP_SECONDS as RETRY_SLEEP_SECONDS,
-    cancel_retry_job,
-    clear_retry_job,
-    get_retry_job,
-    scan_failed_orders,
-    start_retry_orders_job,
-    window_for_london_date,
-    window_from_days,
-)
-
-# Manual Retry status in order statusHistory — skip these on dry-run/retry.
-# Imported defensively so a partial Cloud redeploy can't crash the whole app.
-try:
-    from retry_failed_orders import SKIP_IF_HISTORY_STATUS as RETRY_SKIP_HISTORY_STATUS
-except ImportError:  # pragma: no cover
-    RETRY_SKIP_HISTORY_STATUS = 123
+import retry_failed_orders as _retry_orders
 from quest_prep import (
     PARTNER_ORDER as QUEST_PREP_PARTNERS,
     build_quest_prep_payloads,
@@ -96,6 +78,35 @@ from utils import (
 )
 
 load_dotenv()
+
+# Retry-failed-orders helpers via module attribute access so a stale
+# Cloud mount of retry_failed_orders.py cannot crash the whole app at import.
+RETRY_BATCH_SIZE = getattr(_retry_orders, "BATCH_SIZE", 1000)
+RETRY_MAX_WORKERS = getattr(_retry_orders, "MAX_WORKERS", 10)
+RETRY_SLEEP_SECONDS = getattr(_retry_orders, "SLEEP_SECONDS", 60)
+RETRY_SKIP_HISTORY_STATUS = getattr(_retry_orders, "SKIP_IF_HISTORY_STATUS", 123)
+RETRY_MODULE_VERSION = getattr(_retry_orders, "MODULE_VERSION", "unknown")
+_RETRY_REQUIRED_ATTRS = (
+    "scan_failed_orders",
+    "start_retry_orders_job",
+    "get_retry_job",
+    "cancel_retry_job",
+    "clear_retry_job",
+    "window_for_london_date",
+    "window_from_days",
+)
+RETRY_ORDERS_READY = all(hasattr(_retry_orders, name) for name in _RETRY_REQUIRED_ATTRS)
+
+
+def _retry_attr(name: str):
+    fn = getattr(_retry_orders, name, None)
+    if fn is None:
+        raise RuntimeError(
+            f"retry_failed_orders.{name} is missing "
+            f"(module version {RETRY_MODULE_VERSION}). Redeploy/reboot Streamlit."
+        )
+    return fn
+
 
 # Must be the first Streamlit command — before st.secrets / session_state / widgets.
 st.set_page_config(
@@ -1173,6 +1184,24 @@ def _render_retry_failed_orders(account_id: str) -> None:
         st.error("ACCOUNT_ID is not configured. Set it in the environment or vault.")
         st.stop()
 
+    if not RETRY_ORDERS_READY:
+        missing = [n for n in _RETRY_REQUIRED_ATTRS if not hasattr(_retry_orders, n)]
+        st.error(
+            "This Streamlit deploy has a stale `retry_failed_orders.py` "
+            f"(version `{RETRY_MODULE_VERSION}`). Missing: `{', '.join(missing)}`. "
+            "Reboot the app from the latest `main` commit."
+        )
+        st.stop()
+
+    scan_failed_orders = _retry_attr("scan_failed_orders")
+    start_retry_orders_job = _retry_attr("start_retry_orders_job")
+    get_retry_job = _retry_attr("get_retry_job")
+    cancel_retry_job = _retry_attr("cancel_retry_job")
+    clear_retry_job = _retry_attr("clear_retry_job")
+    window_for_london_date = _retry_attr("window_for_london_date")
+    window_from_days = _retry_attr("window_from_days")
+
+    st.caption(f"retry module `{RETRY_MODULE_VERSION}`")
     st.markdown(
         """
 **How to use**
@@ -1401,6 +1430,10 @@ Queries failed statuses **120** and **122**. Skips any order that already has
 @st.fragment(run_every=1)
 def _render_retry_failed_job(job_id: str) -> None:
     """Poll background retry job; Cancel is clickable between batches."""
+    get_retry_job = _retry_attr("get_retry_job")
+    cancel_retry_job = _retry_attr("cancel_retry_job")
+    clear_retry_job = _retry_attr("clear_retry_job")
+
     job = get_retry_job(job_id)
     if not job:
         st.session_state.pop("retry_failed_job_id", None)
