@@ -1168,12 +1168,21 @@ def _render_retry_failed_orders(account_id: str) -> None:
         st.stop()
 
     st.markdown(
-        "Find orders in failed statuses **120 / 122** and retry them via "
-        "`GET /retry/{{orderId}}` with **X-Deliverect-Version: retail**. "
-        "Orders that already have **123** (Manual Retry) in `statusHistory` are skipped."
+        """
+**How to use**
+1. Pick a time window  
+2. Click **Dry run** — scan only (no retries). See matched / would-retry / skipped  
+3. If the counts look right, confirm and click **Retry all via retail**
+
+Queries failed statuses **120** and **122**. Skips any order that already has
+**123** (Manual Retry) in `statusHistory`. Retries go to
+`GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
+"""
     )
     st.caption(f"Account: `{account_id}`")
-    st.warning("This re-pushes live orders to the POS. Preview first, then confirm.")
+    st.warning(
+        "Retry re-pushes live orders to the POS. Always Dry run first."
+    )
 
     window_mode = st.radio(
         "Time window",
@@ -1203,47 +1212,20 @@ def _render_retry_failed_orders(account_id: str) -> None:
         since, until = window_from_days(int(days))
         st.caption(f"UTC window: `{since}` → `{until}`")
 
-    max_workers = st.slider(
-        "Parallel workers per batch",
-        min_value=1,
-        max_value=16,
-        value=RETRY_MAX_WORKERS,
-        key="retry_failed_workers",
-    )
-    c_batch, c_sleep = st.columns(2)
-    batch_size = c_batch.number_input(
-        "Batch size",
-        min_value=1,
-        max_value=5000,
-        value=RETRY_BATCH_SIZE,
-        step=100,
-        key="retry_failed_batch_size",
-        help="Orders per batch before pausing.",
-    )
-    sleep_seconds = c_sleep.number_input(
-        "Sleep between batches (s)",
-        min_value=0,
-        max_value=600,
-        value=RETRY_SLEEP_SECONDS,
-        step=10,
-        key="retry_failed_sleep",
-    )
-
     filter_key = f"{account_id}|{since}|{until}"
-    dry_col, find_col = st.columns(2)
-    run_dry = dry_col.button(
-        "Dry run",
+    st.subheader("1. Dry run (scan only)")
+    st.caption(
+        "Counts how many failed orders match, how many would be retried, and how many "
+        f"are skipped because history already contains status **{RETRY_SKIP_HISTORY_STATUS}**. "
+        "Does **not** call `/retry`."
+    )
+    if st.button(
+        "Dry run — count retry vs skip",
         type="primary",
+        use_container_width=True,
         key="retry_failed_dry_run",
-        help="Scan only — shows how many would retry vs skip (no /retry calls).",
-    )
-    run_find = find_col.button(
-        "Find failed orders",
-        key="retry_failed_find",
-        help="Same scan as Dry run; loads IDs ready to retry.",
-    )
-    if run_dry or run_find:
-        _track_page("OS Retry Failed Orders Dry Run" if run_dry else "OS Retry Failed Orders")
+    ):
+        _track_page("OS Retry Failed Orders Dry Run")
         progress = st.progress(0.0, text="Scanning…")
         status = st.empty()
 
@@ -1260,7 +1242,7 @@ def _render_retry_failed_orders(account_id: str) -> None:
             )
         except Exception as exc:
             progress.empty()
-            st.error(f"Scan failed: {exc}")
+            st.error(f"Dry run failed: {exc}")
             st.stop()
 
         progress.progress(1.0, text="Done")
@@ -1274,17 +1256,18 @@ def _render_retry_failed_orders(account_id: str) -> None:
             "toRetry": plan["toRetry"],
             "skippedManualRetry": plan["skippedManualRetry"],
             "skipHistoryStatus": plan["skipHistoryStatus"],
-            "dryRun": bool(run_dry),
+            "dryRun": True,
         }
         st.session_state.pop("retry_failed_results", None)
         st.session_state.pop("retry_failed_was_cancelled", None)
 
     cached = st.session_state.get("retry_failed_orders")
     if not cached:
+        st.info("Run **Dry run** to see matched / would-retry / skipped counts.")
         return
 
     if cached.get("filter_key") != filter_key:
-        st.info("Window changed — click **Dry run** to refresh.")
+        st.info("Window changed — click **Dry run** again to refresh counts.")
         return
 
     orders = cached["orders"]
@@ -1292,33 +1275,67 @@ def _render_retry_failed_orders(account_id: str) -> None:
     matched = int(cached.get("matchedTotal") or 0)
     unique_matched = int(cached.get("uniqueMatched") or len(orders) + skipped)
     to_retry = int(cached.get("toRetry") or len(orders))
+    skip_status = cached.get("skipHistoryStatus", RETRY_SKIP_HISTORY_STATUS)
 
-    st.subheader("Dry-run plan" if cached.get("dryRun") else "Failed orders")
+    st.subheader("Dry-run results")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("API matched", f"{matched:,}")
+    m1.metric("API matched (120/122)", f"{matched:,}")
     m2.metric("Unique matched", f"{unique_matched:,}")
     m3.metric("Would retry", f"{to_retry:,}")
-    m4.metric(
-        f"Skipped (history {cached.get('skipHistoryStatus', RETRY_SKIP_HISTORY_STATUS)})",
-        f"{skipped:,}",
-    )
-    st.caption(
-        f"Skipped = already have Manual Retry (**{RETRY_SKIP_HISTORY_STATUS}**) "
-        "in `statusHistory`. Dry run does not call `/retry`."
+    m4.metric(f"Skipped (history {skip_status})", f"{skipped:,}")
+    st.success(
+        f"**Would retry {to_retry:,}** · **skip {skipped:,}** "
+        f"(already had Manual Retry / status {skip_status} in history). "
+        "No `/retry` calls were made."
     )
 
     if not orders:
-        st.info("Nothing to retry in this window (all matched orders were skipped, or none matched).")
+        st.info(
+            "Nothing to retry — all matched orders were skipped, or none matched."
+        )
         return
 
-    st.caption(f"{len(orders):,} order ID(s) ready to retry.")
-    preview = [{"Order ID": oid} for oid in orders[:500]]
-    st.dataframe(preview, use_container_width=True, hide_index=True)
-    if len(orders) > 500:
-        st.caption("Preview limited to the first 500 IDs.")
+    with st.expander(f"Preview order IDs to retry ({len(orders):,})", expanded=False):
+        preview = [{"Order ID": oid} for oid in orders[:500]]
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+        if len(orders) > 500:
+            st.caption("Preview limited to the first 500 IDs.")
+
+    st.subheader("2. Execute retry")
+    with st.expander("Batch settings", expanded=False):
+        max_workers = st.slider(
+            "Parallel workers per batch",
+            min_value=1,
+            max_value=16,
+            value=RETRY_MAX_WORKERS,
+            key="retry_failed_workers",
+        )
+        c_batch, c_sleep = st.columns(2)
+        batch_size = c_batch.number_input(
+            "Batch size",
+            min_value=1,
+            max_value=5000,
+            value=RETRY_BATCH_SIZE,
+            step=100,
+            key="retry_failed_batch_size",
+            help="Orders per batch before pausing.",
+        )
+        sleep_seconds = c_sleep.number_input(
+            "Sleep between batches (s)",
+            min_value=0,
+            max_value=600,
+            value=RETRY_SLEEP_SECONDS,
+            step=10,
+            key="retry_failed_sleep",
+        )
+
+    # Defaults when expander not opened yet this session — widgets still run above.
+    max_workers = st.session_state.get("retry_failed_workers", RETRY_MAX_WORKERS)
+    batch_size = st.session_state.get("retry_failed_batch_size", RETRY_BATCH_SIZE)
+    sleep_seconds = st.session_state.get("retry_failed_sleep", RETRY_SLEEP_SECONDS)
 
     confirmed = st.checkbox(
-        f"I understand this will retry {len(orders):,} order(s)",
+        f"I understand this will retry {len(orders):,} order(s) via retail",
         key="retry_failed_confirm",
     )
     job_id = st.session_state.get("retry_failed_job_id")
@@ -1328,8 +1345,9 @@ def _render_retry_failed_orders(account_id: str) -> None:
         job_running = bool(job_snap and not job_snap.get("done"))
 
     if st.button(
-        "Retry all via retail",
+        f"Retry {len(orders):,} via retail",
         type="primary",
+        use_container_width=True,
         disabled=not confirmed or job_running,
         key="retry_failed_execute",
     ):
@@ -1430,7 +1448,9 @@ def _render_retry_failed_job(job_id: str) -> None:
 
 def page_retry_failed_orders() -> None:
     st.title("Retry failed orders")
-    st.caption("Retail retry for failed POS orders (status 120 / 122).")
+    st.caption(
+        "Dry run first (status 120 / 122) · skip already manually retried (123 in history)."
+    )
     _render_retry_failed_orders(_get_account_id())
 
 
@@ -1962,7 +1982,7 @@ pages = {
         ),
         st.Page(
             page_retry_failed_orders,
-            title="Retry failed orders",
+            title="Retry failed (dry run)",
             icon=":material/replay:",
         ),
     ],
