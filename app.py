@@ -47,8 +47,11 @@ from retry_failed_orders import (
     DEFAULT_STATUSES as RETRY_FAILED_STATUSES,
     MAX_WORKERS as RETRY_MAX_WORKERS,
     SLEEP_SECONDS as RETRY_SLEEP_SECONDS,
+    cancel_retry_job,
+    clear_retry_job,
     fetch_failed_order_ids,
-    retry_orders,
+    get_retry_job,
+    start_retry_orders_job,
     window_for_london_date,
     window_from_days,
 )
@@ -1281,48 +1284,31 @@ def _render_retry_failed_orders(account_id: str) -> None:
         f"I understand this will retry {len(orders):,} order(s)",
         key="retry_failed_confirm",
     )
+    job_id = st.session_state.get("retry_failed_job_id")
+    job_running = False
+    if job_id:
+        job_snap = get_retry_job(job_id)
+        job_running = bool(job_snap and not job_snap.get("done"))
+
     if st.button(
         "Retry all via retail",
         type="primary",
-        disabled=not confirmed,
+        disabled=not confirmed or job_running,
         key="retry_failed_execute",
     ):
         _track_page("OS Retry Failed Orders Execute")
-        progress = st.progress(0.0, text="Retrying…")
-        status = st.empty()
+        st.session_state.pop("retry_failed_results", None)
+        st.session_state["retry_failed_job_id"] = start_retry_orders_job(
+            orders,
+            max_workers=int(max_workers),
+            batch_size=int(batch_size),
+            sleep_seconds=int(sleep_seconds),
+        )
+        st.rerun()
 
-        def on_retry_progress(msg: str) -> None:
-            status.caption(msg)
-            fraction = 0.0
-            if "overall " in msg:
-                try:
-                    overall_part = msg.rsplit("overall ", 1)[1].split()[0]
-                    done_s, total_s = overall_part.split("/", 1)
-                    done_n, total_n = int(done_s), int(total_s)
-                    if total_n > 0:
-                        fraction = min(0.99, done_n / total_n)
-                except (ValueError, IndexError):
-                    pass
-            elif msg.startswith("Done"):
-                fraction = 1.0
-            progress.progress(fraction, text=msg)
-
-        try:
-            results = retry_orders(
-                orders,
-                dry_run=False,
-                max_workers=int(max_workers),
-                batch_size=int(batch_size),
-                sleep_seconds=int(sleep_seconds),
-                progress_callback=on_retry_progress,
-            )
-        except Exception as exc:
-            progress.empty()
-            st.error(f"Retry failed: {exc}")
-            st.stop()
-
-        progress.progress(1.0, text="Done")
-        st.session_state["retry_failed_results"] = results
+    job_id = st.session_state.get("retry_failed_job_id")
+    if job_id:
+        _render_retry_failed_job(job_id)
 
     results = st.session_state.get("retry_failed_results")
     if not results:
@@ -1334,6 +1320,8 @@ def _render_retry_failed_orders(account_id: str) -> None:
     c1.metric("Retried", len(results))
     c2.metric("Succeeded", ok)
     c3.metric("Failed", fail)
+    if st.session_state.get("retry_failed_was_cancelled"):
+        st.warning("Run was cancelled — showing partial results.")
 
     failed_only = st.checkbox("Show failures only", key="retry_failed_failures_only")
     rows = [
@@ -1347,6 +1335,60 @@ def _render_retry_failed_orders(account_id: str) -> None:
         if (not failed_only) or (not r.get("success"))
     ]
     st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+@st.fragment(run_every=1)
+def _render_retry_failed_job(job_id: str) -> None:
+    """Poll background retry job; Cancel is clickable between batches."""
+    job = get_retry_job(job_id)
+    if not job:
+        st.session_state.pop("retry_failed_job_id", None)
+        return
+
+    msg = job.get("message") or ""
+    total = int(job.get("total") or 0)
+    results = job.get("results")
+    done_count = len(results) if results is not None else 0
+
+    fraction = 0.0
+    if "overall " in msg:
+        try:
+            overall_part = msg.rsplit("overall ", 1)[1].split()[0]
+            done_s, total_s = overall_part.split("/", 1)
+            done_n, total_n = int(done_s), int(total_s)
+            if total_n > 0:
+                fraction = min(0.99, done_n / total_n)
+        except (ValueError, IndexError):
+            pass
+    elif job.get("done") and total > 0:
+        fraction = min(1.0, done_count / total) if total else 1.0
+    elif total > 0 and done_count:
+        fraction = min(0.99, done_count / total)
+
+    st.progress(fraction, text=msg or "Working…")
+    st.caption(msg)
+
+    if not job.get("done"):
+        if st.button("Cancel", type="secondary", key=f"retry_failed_cancel_{job_id}"):
+            cancel_retry_job(job_id)
+            st.info("Cancel requested — will stop after the current batch / during sleep.")
+        return
+
+    # Job finished — promote results into session and clear job handle.
+    if job.get("error"):
+        st.error(f"Retry failed: {job['error']}")
+    elif job.get("cancelled"):
+        st.warning(msg or "Cancelled.")
+        st.session_state["retry_failed_was_cancelled"] = True
+    else:
+        st.success(msg or "Done.")
+        st.session_state["retry_failed_was_cancelled"] = False
+
+    if results is not None:
+        st.session_state["retry_failed_results"] = results
+    clear_retry_job(job_id)
+    st.session_state.pop("retry_failed_job_id", None)
+    st.rerun()
 
 
 def page_retry_failed_orders() -> None:

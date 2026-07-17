@@ -13,7 +13,9 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -50,6 +52,7 @@ ORDER_PREVIEW_PROJECTION = {
 }
 
 ProgressCallback = Optional[Callable[[str], None]]
+CancelCheck = Optional[Callable[[], bool]]
 
 
 def _http_ok(response: requests.Response) -> bool:
@@ -381,6 +384,39 @@ def _process_retry_batch(
     return results
 
 
+def _sleep_interruptible(
+    seconds: int,
+    *,
+    should_cancel: CancelCheck = None,
+    progress_callback: ProgressCallback = None,
+) -> bool:
+    """Sleep up to ``seconds``. Returns True if cancelled early."""
+    if seconds <= 0:
+        return bool(should_cancel and should_cancel())
+
+    def log(msg: str) -> None:
+        if progress_callback:
+            progress_callback(msg)
+
+    log(f"Sleeping {seconds}s before next batch … (Cancel to stop)")
+    end = time.time() + seconds
+    last_announce = time.time()
+    while True:
+        if should_cancel and should_cancel():
+            log("Cancel requested — stopping before next batch")
+            return True
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        # Refresh countdown about once a second so the UI stays alive.
+        now = time.time()
+        if now - last_announce >= 1.0:
+            log(f"Sleeping {int(remaining)}s before next batch … (Cancel to stop)")
+            last_announce = now
+        time.sleep(min(0.5, remaining))
+    return bool(should_cancel and should_cancel())
+
+
 def retry_orders(
     orders: list,
     *,
@@ -389,11 +425,15 @@ def retry_orders(
     batch_size: int = BATCH_SIZE,
     sleep_seconds: int = SLEEP_SECONDS,
     progress_callback: ProgressCallback = None,
+    should_cancel: CancelCheck = None,
 ) -> list[dict]:
     """Retry each order in batches; dry_run only lists what would be retried.
 
     ``orders`` may be dicts with ``_id`` or plain ID strings.
     Between batches (when more remain), sleeps ``sleep_seconds``.
+
+    If ``should_cancel`` returns True before a batch or during the inter-batch
+    sleep, returns results completed so far (partial run).
     """
 
     def log(msg: str) -> None:
@@ -442,6 +482,13 @@ def retry_orders(
     completed_before = 0
 
     for batch_number, start in enumerate(range(0, total, batch_size), start=1):
+        if should_cancel and should_cancel():
+            log(
+                f"Cancelled — completed {completed_before}/{total} "
+                f"(stopped before batch {batch_number}/{total_batches})"
+            )
+            return results
+
         batch = unique_ids[start : start + batch_size]
         batch_results = _process_retry_batch(
             batch,
@@ -455,9 +502,18 @@ def retry_orders(
         )
         results.extend(batch_results)
         completed_before += len(batch)
-        if start + batch_size < total and sleep_seconds > 0:
-            log(f"Sleeping {sleep_seconds}s before next batch …")
-            time.sleep(sleep_seconds)
+
+        if start + batch_size < total:
+            if _sleep_interruptible(
+                sleep_seconds,
+                should_cancel=should_cancel,
+                progress_callback=progress_callback,
+            ):
+                log(
+                    f"Cancelled — completed {completed_before}/{total} "
+                    f"(stopped after batch {batch_number}/{total_batches})"
+                )
+                return results
 
     log(f"Done — {completed_before}/{total} retried")
     return results
@@ -474,6 +530,7 @@ def run_retry_failed_orders(
     batch_size: int = BATCH_SIZE,
     sleep_seconds: int = SLEEP_SECONDS,
     progress_callback: ProgressCallback = None,
+    should_cancel: CancelCheck = None,
 ) -> dict:
     """Fetch failed order IDs (minimal projection) and retry them."""
     statuses = list(statuses or DEFAULT_STATUSES)
@@ -484,6 +541,22 @@ def run_retry_failed_orders(
         statuses=statuses,
         progress_callback=progress_callback,
     )
+    if should_cancel and should_cancel():
+        if progress_callback:
+            progress_callback("Cancelled before retries started")
+        return {
+            "accountId": account,
+            "since": since,
+            "until": until,
+            "statuses": statuses,
+            "dryRun": dry_run,
+            "orderCount": len(order_ids),
+            "successCount": 0,
+            "failureCount": 0,
+            "orderIds": order_ids,
+            "results": [],
+            "cancelled": True,
+        }
     results = retry_orders(
         order_ids,
         dry_run=dry_run,
@@ -491,9 +564,11 @@ def run_retry_failed_orders(
         batch_size=batch_size,
         sleep_seconds=sleep_seconds,
         progress_callback=progress_callback,
+        should_cancel=should_cancel,
     )
     ok = sum(1 for r in results if r.get("success"))
     fail = len(results) - ok
+    cancelled = bool(should_cancel and should_cancel())
     return {
         "accountId": account,
         "since": since,
@@ -505,7 +580,105 @@ def run_retry_failed_orders(
         "failureCount": fail,
         "orderIds": order_ids,
         "results": results,
+        "cancelled": cancelled,
     }
+
+
+# ---------------------------------------------------------------------------
+# Background jobs for Streamlit cancel button (thread-safe progress store)
+# ---------------------------------------------------------------------------
+
+_RETRY_JOBS: dict[str, dict[str, Any]] = {}
+_RETRY_JOBS_LOCK = threading.Lock()
+
+
+def start_retry_orders_job(
+    orders: list,
+    *,
+    max_workers: int = MAX_WORKERS,
+    batch_size: int = BATCH_SIZE,
+    sleep_seconds: int = SLEEP_SECONDS,
+) -> str:
+    """Start ``retry_orders`` in a background thread. Returns job id."""
+    job_id = uuid.uuid4().hex
+    cancel_event = threading.Event()
+    job: dict[str, Any] = {
+        "id": job_id,
+        "cancel": cancel_event,
+        "message": "Starting…",
+        "done": False,
+        "cancelled": False,
+        "error": None,
+        "results": None,
+        "total": len(orders),
+    }
+    with _RETRY_JOBS_LOCK:
+        _RETRY_JOBS[job_id] = job
+
+    def worker() -> None:
+        def on_progress(msg: str) -> None:
+            job["message"] = msg
+
+        try:
+            results = retry_orders(
+                orders,
+                dry_run=False,
+                max_workers=max_workers,
+                batch_size=batch_size,
+                sleep_seconds=sleep_seconds,
+                progress_callback=on_progress,
+                should_cancel=cancel_event.is_set,
+            )
+            job["results"] = results
+            job["cancelled"] = cancel_event.is_set()
+            if job["cancelled"]:
+                job["message"] = (
+                    f"Cancelled — completed {len(results)}/{len(orders)}"
+                )
+            else:
+                job["message"] = f"Done — {len(results)}/{len(orders)} retried"
+        except Exception as exc:
+            job["error"] = str(exc)
+            job["message"] = f"Failed: {exc}"
+        finally:
+            job["done"] = True
+
+    threading.Thread(
+        target=worker, daemon=True, name=f"retry-job-{job_id[:8]}"
+    ).start()
+    return job_id
+
+
+def get_retry_job(job_id: str) -> Optional[dict[str, Any]]:
+    with _RETRY_JOBS_LOCK:
+        job = _RETRY_JOBS.get(job_id)
+    if not job:
+        return None
+    return {
+        "id": job["id"],
+        "message": job.get("message") or "",
+        "done": bool(job.get("done")),
+        "cancelled": bool(job.get("cancelled")),
+        "error": job.get("error"),
+        "results": job.get("results"),
+        "total": job.get("total") or 0,
+    }
+
+
+def cancel_retry_job(job_id: str) -> bool:
+    """Request cancel; takes effect between batches / during inter-batch sleep."""
+    with _RETRY_JOBS_LOCK:
+        job = _RETRY_JOBS.get(job_id)
+    if not job:
+        return False
+    job["cancel"].set()
+    job["message"] = "Cancel requested — will stop after the current batch…"
+    return True
+
+
+def clear_retry_job(job_id: str) -> None:
+    with _RETRY_JOBS_LOCK:
+        _RETRY_JOBS.pop(job_id, None)
 
 
 def _resolve_account_id(cli_account: str) -> str:
