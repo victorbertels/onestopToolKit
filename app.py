@@ -42,6 +42,16 @@ from je_cancelled_courier_export import (
     run_je_cancelled_courier_export,
 )
 from main import createRetailChannels
+from retry_failed_orders import (
+    BATCH_SIZE as RETRY_BATCH_SIZE,
+    DEFAULT_STATUSES as RETRY_FAILED_STATUSES,
+    MAX_WORKERS as RETRY_MAX_WORKERS,
+    SLEEP_SECONDS as RETRY_SLEEP_SECONDS,
+    fetch_failed_order_ids,
+    retry_orders,
+    window_for_london_date,
+    window_from_days,
+)
 from quest_prep import (
     PARTNER_ORDER as QUEST_PREP_PARTNERS,
     build_quest_prep_payloads,
@@ -1149,6 +1159,190 @@ def page_je_cancelled_courier_export() -> None:
     _render_je_cancelled_courier_export(_get_account_id())
 
 
+def _render_retry_failed_orders(account_id: str) -> None:
+    if not account_id:
+        st.error("ACCOUNT_ID is not configured. Set it in the environment or vault.")
+        st.stop()
+
+    st.markdown(
+        "Find orders in failed statuses "
+        f"(`{RETRY_FAILED_STATUSES}`) and retry them via "
+        "`GET /retry/{{orderId}}` with **X-Deliverect-Version: retail**."
+    )
+    st.caption(f"Account: `{account_id}`")
+    st.warning("This re-pushes live orders to the POS. Preview first, then confirm.")
+
+    window_mode = st.radio(
+        "Time window",
+        options=["London calendar day", "Rolling days (UTC)"],
+        horizontal=True,
+        key="retry_failed_window_mode",
+    )
+
+    since = until = ""
+    if window_mode == "London calendar day":
+        day = st.date_input(
+            "London day",
+            value=london_now().date(),
+            key="retry_failed_day",
+        )
+        since, until = window_for_london_date(day)
+        st.caption(f"UTC window: `{since}` → `{until}`")
+    else:
+        days = st.number_input(
+            "Lookback (days)",
+            min_value=1,
+            max_value=89,
+            value=1,
+            step=1,
+            key="retry_failed_days",
+        )
+        since, until = window_from_days(int(days))
+        st.caption(f"UTC window: `{since}` → `{until}`")
+
+    max_workers = st.slider(
+        "Parallel workers per batch",
+        min_value=1,
+        max_value=16,
+        value=RETRY_MAX_WORKERS,
+        key="retry_failed_workers",
+    )
+    c_batch, c_sleep = st.columns(2)
+    batch_size = c_batch.number_input(
+        "Batch size",
+        min_value=1,
+        max_value=5000,
+        value=RETRY_BATCH_SIZE,
+        step=100,
+        key="retry_failed_batch_size",
+        help="Orders per batch before pausing.",
+    )
+    sleep_seconds = c_sleep.number_input(
+        "Sleep between batches (s)",
+        min_value=0,
+        max_value=600,
+        value=RETRY_SLEEP_SECONDS,
+        step=10,
+        key="retry_failed_sleep",
+    )
+
+    filter_key = f"{account_id}|{since}|{until}"
+    if st.button("Find failed orders", type="primary", key="retry_failed_find"):
+        _track_page("OS Retry Failed Orders")
+        progress = st.progress(0.0, text="Searching…")
+        status = st.empty()
+
+        def on_progress(msg: str) -> None:
+            status.caption(msg)
+            progress.progress(0.5, text=msg)
+
+        try:
+            order_ids = fetch_failed_order_ids(
+                account_id,
+                since=since,
+                until=until,
+                progress_callback=on_progress,
+            )
+        except Exception as exc:
+            progress.empty()
+            st.error(f"Search failed: {exc}")
+            st.stop()
+
+        progress.progress(1.0, text="Done")
+        st.session_state["retry_failed_orders"] = {
+            "filter_key": filter_key,
+            "since": since,
+            "until": until,
+            "orders": order_ids,
+        }
+        st.session_state.pop("retry_failed_results", None)
+
+    cached = st.session_state.get("retry_failed_orders")
+    if not cached:
+        return
+
+    if cached.get("filter_key") != filter_key:
+        st.info("Window changed — click **Find failed orders** to refresh.")
+        return
+
+    orders = cached["orders"]
+    st.subheader(f"Failed orders — {len(orders):,}")
+    if not orders:
+        st.info("No failed orders in this window.")
+        return
+
+    st.caption("IDs only (minimal projection) to avoid timeouts / OOM on large days.")
+    preview = [{"Order ID": oid} for oid in orders[:500]]
+    st.dataframe(preview, use_container_width=True, hide_index=True)
+    if len(orders) > 500:
+        st.caption("Preview limited to the first 500 IDs.")
+
+    confirmed = st.checkbox(
+        f"I understand this will retry {len(orders):,} order(s)",
+        key="retry_failed_confirm",
+    )
+    if st.button(
+        "Retry all via retail",
+        type="primary",
+        disabled=not confirmed,
+        key="retry_failed_execute",
+    ):
+        _track_page("OS Retry Failed Orders Execute")
+        progress = st.progress(0.0, text="Retrying…")
+        status = st.empty()
+
+        def on_retry_progress(msg: str) -> None:
+            status.caption(msg)
+            progress.progress(0.5, text=msg)
+
+        try:
+            results = retry_orders(
+                orders,
+                dry_run=False,
+                max_workers=int(max_workers),
+                batch_size=int(batch_size),
+                sleep_seconds=int(sleep_seconds),
+                progress_callback=on_retry_progress,
+            )
+        except Exception as exc:
+            progress.empty()
+            st.error(f"Retry failed: {exc}")
+            st.stop()
+
+        progress.progress(1.0, text="Done")
+        st.session_state["retry_failed_results"] = results
+
+    results = st.session_state.get("retry_failed_results")
+    if not results:
+        return
+
+    ok = sum(1 for r in results if r.get("success"))
+    fail = len(results) - ok
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Retried", len(results))
+    c2.metric("Succeeded", ok)
+    c3.metric("Failed", fail)
+
+    failed_only = st.checkbox("Show failures only", key="retry_failed_failures_only")
+    rows = [
+        {
+            "Order ID": r.get("orderId") or "",
+            "HTTP": r.get("statusCode"),
+            "OK": "Y" if r.get("success") else "N",
+            "Error": r.get("error") or "",
+        }
+        for r in results
+        if (not failed_only) or (not r.get("success"))
+    ]
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def page_retry_failed_orders() -> None:
+    st.title("Retry failed orders")
+    st.caption("Retail retry for failed POS orders (status 120 / 122).")
+    _render_retry_failed_orders(_get_account_id())
+
+
 def _render_close_open_stores(account_id: str) -> None:
     st.markdown(
         "Set busy mode on **channel links** matching your location and channel selection."
@@ -1674,6 +1868,11 @@ pages = {
             page_je_cancelled_courier_export,
             title="JE cancelled courier",
             icon=":material/local_shipping:",
+        ),
+        st.Page(
+            page_retry_failed_orders,
+            title="Retry failed orders",
+            icon=":material/replay:",
         ),
     ],
     "Store availability": [
