@@ -36,6 +36,7 @@ RETRY_BASE = f"{API_BASE}/retry"
 FAILED_STATUSES = [120, 122]
 DEFAULT_STATUSES = list(FAILED_STATUSES)
 # Manual Retry — if this appears in statusHistory, do not retry again.
+# Exported for the Streamlit UI (dry-run skip metric label).
 SKIP_IF_HISTORY_STATUS = 123
 
 PAGE_SIZE = 500

@@ -45,7 +45,6 @@ from main import createRetailChannels
 from retry_failed_orders import (
     BATCH_SIZE as RETRY_BATCH_SIZE,
     MAX_WORKERS as RETRY_MAX_WORKERS,
-    SKIP_IF_HISTORY_STATUS as RETRY_SKIP_HISTORY_STATUS,
     SLEEP_SECONDS as RETRY_SLEEP_SECONDS,
     cancel_retry_job,
     clear_retry_job,
@@ -55,6 +54,13 @@ from retry_failed_orders import (
     window_for_london_date,
     window_from_days,
 )
+
+# Manual Retry status in order statusHistory — skip these on dry-run/retry.
+# Imported defensively so a partial Cloud redeploy can't crash the whole app.
+try:
+    from retry_failed_orders import SKIP_IF_HISTORY_STATUS as RETRY_SKIP_HISTORY_STATUS
+except ImportError:  # pragma: no cover
+    RETRY_SKIP_HISTORY_STATUS = 123
 from quest_prep import (
     PARTNER_ORDER as QUEST_PREP_PARTNERS,
     build_quest_prep_payloads,
