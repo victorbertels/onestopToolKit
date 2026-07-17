@@ -166,15 +166,15 @@ def _fetch_orders_page(
     return response.json()
 
 
-def fetch_failed_order_ids(
+def scan_failed_orders(
     account: str,
     *,
     since: str,
     until: str,
     statuses: Optional[list[int]] = None,
     progress_callback: ProgressCallback = None,
-) -> list[str]:
-    """Fetch failed order IDs, skipping any with Manual Retry (123) in history."""
+) -> dict[str, Any]:
+    """Scan failed orders and return retry IDs plus skip counts (no /retry calls)."""
     statuses = list(statuses or DEFAULT_STATUSES)
 
     def log(msg: str) -> None:
@@ -218,7 +218,6 @@ def fetch_failed_order_ids(
 
     _take(page1.get("_items") or [])
 
-    # Sequential pages — parallel page fetches OOM on large result sets.
     for page in range(2, pages + 1):
         data = _fetch_orders_page(
             account,
@@ -237,11 +236,44 @@ def fetch_failed_order_ids(
                 f"with history status {SKIP_IF_HISTORY_STATUS})"
             )
 
+    plan = {
+        "accountId": account,
+        "since": since,
+        "until": until,
+        "statuses": statuses,
+        "matchedTotal": total,
+        "uniqueMatched": len(seen),
+        "toRetry": len(ids),
+        "skippedManualRetry": skipped_manual_retry,
+        "skipHistoryStatus": SKIP_IF_HISTORY_STATUS,
+        "orderIds": ids,
+    }
     log(
-        f"Loaded {len(ids):,} order ID(s) to retry "
-        f"(skipped {skipped_manual_retry:,} already manually retried / status {SKIP_IF_HISTORY_STATUS} in history)"
+        f"Dry-run plan: {plan['toRetry']:,} would retry, "
+        f"{plan['skippedManualRetry']:,} skipped "
+        f"(history status {SKIP_IF_HISTORY_STATUS}), "
+        f"{plan['uniqueMatched']:,} unique matched of {plan['matchedTotal']:,} reported"
     )
-    return ids
+    return plan
+
+
+def fetch_failed_order_ids(
+    account: str,
+    *,
+    since: str,
+    until: str,
+    statuses: Optional[list[int]] = None,
+    progress_callback: ProgressCallback = None,
+) -> list[str]:
+    """Fetch failed order IDs, skipping any with Manual Retry (123) in history."""
+    plan = scan_failed_orders(
+        account,
+        since=since,
+        until=until,
+        statuses=statuses,
+        progress_callback=progress_callback,
+    )
+    return list(plan["orderIds"])
 
 
 def fetch_failed_orders(
@@ -587,15 +619,16 @@ def run_retry_failed_orders(
     progress_callback: ProgressCallback = None,
     should_cancel: CancelCheck = None,
 ) -> dict:
-    """Fetch failed order IDs (minimal projection) and retry them."""
+    """Scan failed orders (with skip stats) and optionally retry them."""
     statuses = list(statuses or DEFAULT_STATUSES)
-    order_ids = fetch_failed_order_ids(
+    plan = scan_failed_orders(
         account,
         since=since,
         until=until,
         statuses=statuses,
         progress_callback=progress_callback,
     )
+    order_ids = list(plan["orderIds"])
     if should_cancel and should_cancel():
         if progress_callback:
             progress_callback("Cancelled before retries started")
@@ -606,6 +639,11 @@ def run_retry_failed_orders(
             "statuses": statuses,
             "dryRun": dry_run,
             "orderCount": len(order_ids),
+            "matchedTotal": plan["matchedTotal"],
+            "uniqueMatched": plan["uniqueMatched"],
+            "toRetry": plan["toRetry"],
+            "skippedManualRetry": plan["skippedManualRetry"],
+            "skipHistoryStatus": plan["skipHistoryStatus"],
             "successCount": 0,
             "failureCount": 0,
             "orderIds": order_ids,
@@ -631,6 +669,11 @@ def run_retry_failed_orders(
         "statuses": statuses,
         "dryRun": dry_run,
         "orderCount": len(order_ids),
+        "matchedTotal": plan["matchedTotal"],
+        "uniqueMatched": plan["uniqueMatched"],
+        "toRetry": plan["toRetry"],
+        "skippedManualRetry": plan["skippedManualRetry"],
+        "skipHistoryStatus": plan["skipHistoryStatus"],
         "successCount": ok,
         "failureCount": fail,
         "orderIds": order_ids,
@@ -876,6 +919,11 @@ def main() -> None:
         "until": result["until"],
         "statuses": result["statuses"],
         "dryRun": result["dryRun"],
+        "matchedTotal": result.get("matchedTotal"),
+        "uniqueMatched": result.get("uniqueMatched"),
+        "toRetry": result.get("toRetry", result["orderCount"]),
+        "skippedManualRetry": result.get("skippedManualRetry"),
+        "skipHistoryStatus": result.get("skipHistoryStatus"),
         "orderCount": result["orderCount"],
         "successCount": result["successCount"],
         "failureCount": result["failureCount"],

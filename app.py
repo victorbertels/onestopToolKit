@@ -45,11 +45,12 @@ from main import createRetailChannels
 from retry_failed_orders import (
     BATCH_SIZE as RETRY_BATCH_SIZE,
     MAX_WORKERS as RETRY_MAX_WORKERS,
+    SKIP_IF_HISTORY_STATUS as RETRY_SKIP_HISTORY_STATUS,
     SLEEP_SECONDS as RETRY_SLEEP_SECONDS,
     cancel_retry_job,
     clear_retry_job,
-    fetch_failed_order_ids,
     get_retry_job,
+    scan_failed_orders,
     start_retry_orders_job,
     window_for_london_date,
     window_from_days,
@@ -1229,9 +1230,21 @@ def _render_retry_failed_orders(account_id: str) -> None:
     )
 
     filter_key = f"{account_id}|{since}|{until}"
-    if st.button("Find failed orders", type="primary", key="retry_failed_find"):
-        _track_page("OS Retry Failed Orders")
-        progress = st.progress(0.0, text="Searching…")
+    dry_col, find_col = st.columns(2)
+    run_dry = dry_col.button(
+        "Dry run",
+        type="primary",
+        key="retry_failed_dry_run",
+        help="Scan only — shows how many would retry vs skip (no /retry calls).",
+    )
+    run_find = find_col.button(
+        "Find failed orders",
+        key="retry_failed_find",
+        help="Same scan as Dry run; loads IDs ready to retry.",
+    )
+    if run_dry or run_find:
+        _track_page("OS Retry Failed Orders Dry Run" if run_dry else "OS Retry Failed Orders")
+        progress = st.progress(0.0, text="Scanning…")
         status = st.empty()
 
         def on_progress(msg: str) -> None:
@@ -1239,7 +1252,7 @@ def _render_retry_failed_orders(account_id: str) -> None:
             progress.progress(0.5, text=msg)
 
         try:
-            order_ids = fetch_failed_order_ids(
+            plan = scan_failed_orders(
                 account_id,
                 since=since,
                 until=until,
@@ -1247,7 +1260,7 @@ def _render_retry_failed_orders(account_id: str) -> None:
             )
         except Exception as exc:
             progress.empty()
-            st.error(f"Search failed: {exc}")
+            st.error(f"Scan failed: {exc}")
             st.stop()
 
         progress.progress(1.0, text="Done")
@@ -1255,25 +1268,50 @@ def _render_retry_failed_orders(account_id: str) -> None:
             "filter_key": filter_key,
             "since": since,
             "until": until,
-            "orders": order_ids,
+            "orders": plan["orderIds"],
+            "matchedTotal": plan["matchedTotal"],
+            "uniqueMatched": plan["uniqueMatched"],
+            "toRetry": plan["toRetry"],
+            "skippedManualRetry": plan["skippedManualRetry"],
+            "skipHistoryStatus": plan["skipHistoryStatus"],
+            "dryRun": bool(run_dry),
         }
         st.session_state.pop("retry_failed_results", None)
+        st.session_state.pop("retry_failed_was_cancelled", None)
 
     cached = st.session_state.get("retry_failed_orders")
     if not cached:
         return
 
     if cached.get("filter_key") != filter_key:
-        st.info("Window changed — click **Find failed orders** to refresh.")
+        st.info("Window changed — click **Dry run** to refresh.")
         return
 
     orders = cached["orders"]
-    st.subheader(f"Failed orders — {len(orders):,}")
+    skipped = int(cached.get("skippedManualRetry") or 0)
+    matched = int(cached.get("matchedTotal") or 0)
+    unique_matched = int(cached.get("uniqueMatched") or len(orders) + skipped)
+    to_retry = int(cached.get("toRetry") or len(orders))
+
+    st.subheader("Dry-run plan" if cached.get("dryRun") else "Failed orders")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("API matched", f"{matched:,}")
+    m2.metric("Unique matched", f"{unique_matched:,}")
+    m3.metric("Would retry", f"{to_retry:,}")
+    m4.metric(
+        f"Skipped (history {cached.get('skipHistoryStatus', RETRY_SKIP_HISTORY_STATUS)})",
+        f"{skipped:,}",
+    )
+    st.caption(
+        f"Skipped = already have Manual Retry (**{RETRY_SKIP_HISTORY_STATUS}**) "
+        "in `statusHistory`. Dry run does not call `/retry`."
+    )
+
     if not orders:
-        st.info("No failed orders in this window.")
+        st.info("Nothing to retry in this window (all matched orders were skipped, or none matched).")
         return
 
-    st.caption("IDs only (minimal projection) to avoid timeouts / OOM on large days.")
+    st.caption(f"{len(orders):,} order ID(s) ready to retry.")
     preview = [{"Order ID": oid} for oid in orders[:500]]
     st.dataframe(preview, use_container_width=True, hide_index=True)
     if len(orders) > 500:
