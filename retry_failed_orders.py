@@ -319,6 +319,8 @@ def _process_retry_batch(
     max_workers: int,
     batch_number: int,
     total_batches: int,
+    completed_before: int = 0,
+    grand_total: int = 0,
     progress_callback: ProgressCallback = None,
 ) -> list[dict]:
     """Retry one batch of order IDs in parallel."""
@@ -327,11 +329,17 @@ def _process_retry_batch(
         if progress_callback:
             progress_callback(msg)
 
+    batch_total = len(order_ids)
+    overall = grand_total or (completed_before + batch_total)
     log(
-        f"Batch {batch_number}/{total_batches}: retrying {len(order_ids)} order(s) "
-        f"with {max_workers} workers"
+        f"Batch {batch_number}/{total_batches}: starting {batch_total} order(s) "
+        f"with {max_workers} workers "
+        f"(overall {completed_before}/{overall})"
     )
     results: list[dict] = []
+    done = 0
+    ok = 0
+    fail = 0
 
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
         futures = {
@@ -350,11 +358,25 @@ def _process_retry_batch(
                 }
             result["dryRun"] = False
             results.append(result)
+            done += 1
+            if result.get("success"):
+                ok += 1
+            else:
+                fail += 1
 
-    ok = sum(1 for r in results if r.get("success"))
+            # Live counter so long batches don't look stuck.
+            if done == 1 or done == batch_total or done % 10 == 0:
+                overall_done = completed_before + done
+                log(
+                    f"Batch {batch_number}/{total_batches}: "
+                    f"{done}/{batch_total} "
+                    f"(ok={ok} fail={fail}) · "
+                    f"overall {overall_done}/{overall}"
+                )
+
     log(
         f"Batch {batch_number}/{total_batches} done — "
-        f"ok={ok} fail={len(results) - ok}"
+        f"ok={ok} fail={fail}"
     )
     return results
 
@@ -417,24 +439,27 @@ def retry_orders(
     log(f"Retrying {total} failed order(s) in batches of {batch_size}")
     headers = _retail_headers()
     results: list[dict] = []
+    completed_before = 0
 
     for batch_number, start in enumerate(range(0, total, batch_size), start=1):
         batch = unique_ids[start : start + batch_size]
-        results.extend(
-            _process_retry_batch(
-                batch,
-                headers=headers,
-                max_workers=max_workers,
-                batch_number=batch_number,
-                total_batches=total_batches,
-                progress_callback=progress_callback,
-            )
+        batch_results = _process_retry_batch(
+            batch,
+            headers=headers,
+            max_workers=max_workers,
+            batch_number=batch_number,
+            total_batches=total_batches,
+            completed_before=completed_before,
+            grand_total=total,
+            progress_callback=progress_callback,
         )
+        results.extend(batch_results)
+        completed_before += len(batch)
         if start + batch_size < total and sleep_seconds > 0:
             log(f"Sleeping {sleep_seconds}s before next batch …")
             time.sleep(sleep_seconds)
 
-    log("Done")
+    log(f"Done — {completed_before}/{total} retried")
     return results
 
 

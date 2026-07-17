@@ -1293,7 +1293,19 @@ def _render_retry_failed_orders(account_id: str) -> None:
 
         def on_retry_progress(msg: str) -> None:
             status.caption(msg)
-            progress.progress(0.5, text=msg)
+            fraction = 0.0
+            if "overall " in msg:
+                try:
+                    overall_part = msg.rsplit("overall ", 1)[1].split()[0]
+                    done_s, total_s = overall_part.split("/", 1)
+                    done_n, total_n = int(done_s), int(total_s)
+                    if total_n > 0:
+                        fraction = min(0.99, done_n / total_n)
+                except (ValueError, IndexError):
+                    pass
+            elif msg.startswith("Done"):
+                fraction = 1.0
+            progress.progress(fraction, text=msg)
 
         try:
             results = retry_orders(
