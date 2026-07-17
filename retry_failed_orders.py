@@ -1,6 +1,6 @@
 """Retry failed Deliverect retail orders via GET /retry/{orderId}.
 
-Finds orders in failed statuses (120, 122) for an account + time window, then
+Finds orders in failed status 122 for an account + time window, then
 retries each through the retail retry endpoint.
 
 Order listing uses a minimal ``_id`` projection and sequential paging so large
@@ -29,8 +29,8 @@ from utils import inventory_sync_created_range_for_date, london_now
 API_BASE = "https://api.deliverect.io"
 RETRY_BASE = f"{API_BASE}/retry"
 
-# Deliverect failed-order statuses (same set as ops retry scripts).
-FAILED_STATUSES = [120, 122]
+# Deliverect failed-order status for retail retry.
+FAILED_STATUSES = [122]
 DEFAULT_STATUSES = list(FAILED_STATUSES)
 
 PAGE_SIZE = 500
@@ -696,7 +696,7 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(
         description=(
-            "List failed retail orders (status 120/122) and retry them via "
+            "List failed retail orders (status 122) and retry them via "
             "GET /retry/{orderId} with X-Deliverect-Version: retail."
         )
     )
