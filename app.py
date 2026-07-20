@@ -54,6 +54,10 @@ from suspend_stores import (
     parse_ids as parse_suspend_ids,
     run_set_statuses_by_ids,
 )
+from unrestrict_menu_push import (
+    parse_ids as parse_menu_push_ids,
+    run_clear_menu_push_restrictions,
+)
 from utils import (
     CHANNEL_LINK_STATUS_OPTIONS,
     CHANNEL_LINK_STATUS_SUSPENDED,
@@ -1973,6 +1977,144 @@ def page_suspend_stores() -> None:
     _render_suspend_stores(_get_account_id())
 
 
+def _render_unrestrict_menu_push(account_id: str) -> None:
+    st.markdown(
+        "Paste channel link IDs to set **`channelSettings.isMenuPushRestricted`** to **`false`**."
+    )
+    st.warning(
+        "This patches live channel settings. Double-check the IDs before proceeding."
+    )
+    st.caption(f"Account: `{account_id}`")
+    st.markdown("---")
+
+    ids_raw = st.text_area(
+        "Channel link IDs",
+        height=160,
+        placeholder="Paste one channel link `_id` per line",
+        help="Only these channel links are updated.",
+        key="menu_push_ids",
+    )
+    channel_link_ids = parse_menu_push_ids(ids_raw)
+    target_count = len(channel_link_ids)
+    target_label = (
+        f"{target_count} channel link(s) → isMenuPushRestricted=false"
+        if target_count
+        else "0 channel links"
+    )
+
+    if target_count == 0:
+        st.info("Enter at least one channel link ID.")
+    else:
+        st.info(f"Will update **{target_label}**.")
+        preview_rows = [
+            {"Type": "Channel link", "ID": item_id, "Setting": "isMenuPushRestricted=false"}
+            for item_id in channel_link_ids
+        ]
+        if len(preview_rows) <= 40:
+            st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+
+    max_workers = st.slider(
+        "Parallel requests",
+        min_value=1,
+        max_value=50,
+        value=10,
+        key="menu_push_max_workers",
+    )
+
+    confirm = st.checkbox(
+        f"I confirm I want to **clear menu push restriction** for {target_label}",
+        key="menu_push_confirm",
+    )
+
+    execute_disabled = target_count == 0 or not confirm
+
+    if st.button(
+        "Clear menu push restriction",
+        type="primary",
+        disabled=execute_disabled,
+        key="menu_push_run",
+    ):
+        _track_page("OS Unrestrict Menu Push")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        def on_progress(completed, total, row):
+            progress_bar.progress(completed / total if total else 1.0)
+            status_text.text(
+                f"{completed}/{total} — {row.get('target_type')} "
+                f"{row.get('target_name') or row.get('target_id')}"
+            )
+
+        try:
+            with st.spinner("Updating channel settings..."):
+                results = run_clear_menu_push_restrictions(
+                    channel_link_ids,
+                    account_id=account_id,
+                    max_workers=max_workers,
+                    on_progress=on_progress,
+                )
+
+            progress_bar.empty()
+            status_text.empty()
+            st.session_state["menu_push_results"] = results
+            st.session_state["menu_push_results_account"] = account_id
+            success_count = sum(1 for r in results if r.get("success"))
+            st.success(f"Finished: **{success_count}/{len(results)}** succeeded.")
+        except Exception as exc:
+            progress_bar.empty()
+            status_text.empty()
+            st.error(f"Menu push update failed: {exc}")
+
+    if st.session_state.get("menu_push_results"):
+        results = st.session_state["menu_push_results"]
+        display = [
+            {
+                "Success": row.get("success"),
+                "Location": row.get("location_name"),
+                "Channel": row.get("channel_name"),
+                "Name": row.get("target_name"),
+                "ID": row.get("target_id"),
+                "Previous value": (
+                    row.get("previous_value")
+                    if row.get("previous_value") is not None
+                    else "—"
+                ),
+                "Error": row.get("error") or "—",
+            }
+            for row in results
+        ]
+
+        failed_only = st.checkbox("Show failures only", key="menu_push_failures_only")
+        shown = [r for r in display if not r["Success"]] if failed_only else display
+        st.dataframe(shown, use_container_width=True, hide_index=True)
+
+        safe_account = "".join(
+            c
+            for c in (st.session_state.get("menu_push_results_account") or "account")
+            if c.isalnum() or c in (" ", "-", "_")
+        ).strip().replace(" ", "_")
+        csv_buf = StringIO()
+        if shown:
+            writer = csv.DictWriter(csv_buf, fieldnames=list(shown[0].keys()))
+            writer.writeheader()
+            writer.writerows(shown)
+        st.download_button(
+            label="Download results CSV",
+            data=csv_buf.getvalue(),
+            file_name=f"menu_push_unrestrict_{safe_account}.csv",
+            mime="text/csv",
+            key="menu_push_download",
+        )
+
+
+def page_unrestrict_menu_push() -> None:
+    st.title("Unrestrict menu push")
+    st.caption(
+        "Set channelSettings.isMenuPushRestricted to false for a list of channel link IDs."
+    )
+    _render_unrestrict_menu_push(_get_account_id())
+
+
 _require_password()
 _require_account_id()
 
@@ -2009,6 +2151,11 @@ pages = {
             icon=":material/storefront:",
         ),
         st.Page(page_channel_activation, title="Partner emails", icon=":material/mail:"),
+        st.Page(
+            page_unrestrict_menu_push,
+            title="Unrestrict menu push",
+            icon=":material/lock_open:",
+        ),
     ],
     "Inventory sync": [
         st.Page(page_inventory_sync, title="Analysis", icon=":material/inventory_2:"),
