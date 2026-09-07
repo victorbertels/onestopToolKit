@@ -1,5 +1,5 @@
 """
-Streamlit UI for Deliverect toolkit: retail channel setup and opening hours export/import.
+Streamlit UI for Deliverect toolkit: retail channel setup, opening hours, and channel URLs.
 
 Run from the project directory:
   streamlit run app.py
@@ -34,6 +34,14 @@ from close_open_stores import (
     load_account_busy_mode_data,
     run_busy_mode_for_channel_links,
     select_channel_links,
+)
+from export_import_channel_urls import (
+    CSV_COLUMNS as CHANNEL_URL_CSV_COLUMNS,
+    export_channel_urls,
+    import_channel_urls,
+    parse_csv as parse_channel_url_csv,
+    row_has_url_update,
+    to_csv_string as channel_urls_csv_text,
 )
 from je_cancelled_courier_export import (
     DEFAULT_DAYS as JE_CANCELLED_DEFAULT_DAYS,
@@ -393,6 +401,12 @@ def _opening_hours_export_filename(account_id: str) -> str:
     return f"opening_hours_{short_acc}.csv"
 
 
+def _channel_urls_export_filename(account_id: str) -> str:
+    short_acc = re.sub(r"[^\w]", "", account_id)[:12] or "account"
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    return f"channel_urls_{short_acc}_{date_str}.csv"
+
+
 def _import_preview_row(detail: dict) -> dict:
     status_labels = {
         "full": "Ready (7/7)",
@@ -736,7 +750,7 @@ def _sign_out_sidebar() -> None:
         if st.button("Sign out", key="sign_out", use_container_width=True):
             st.session_state.pop("authenticated", None)
             for key in list(st.session_state.keys()):
-                if key.startswith("busy_mode_") or key.startswith("je_cancelled_"):
+                if key.startswith(("busy_mode_", "je_cancelled_", "channel_urls_")):
                     st.session_state.pop(key, None)
             st.rerun()
 
@@ -755,6 +769,255 @@ def page_opening_hours_import() -> None:
         "Export channel link opening hours to CSV, edit in Excel, then import back using the same format."
     )
     _render_opening_hours_import(_get_account_id())
+
+
+def _render_channel_urls_export(account_id: str) -> None:
+    st.subheader("Export to CSV")
+    st.markdown(
+        "Fetches all channel links (except testing, status 2) and builds a CSV: "
+        "`locationName`, `locationId`, `channelLinkId`, `channelLinkName`, `storeUrl`."
+    )
+    st.caption(f"Account: `{account_id}`")
+
+    if st.button("Fetch channel URLs", type="primary", key="channel_urls_export_btn"):
+        if not account_id.strip():
+            st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
+        else:
+            _track_page("OS Channel URLs Export")
+            progress_bar = st.progress(0.0, text="Starting export…")
+            status = st.empty()
+
+            def on_fetch_progress(phase: str, page: int, page_items: int, total: int) -> None:
+                if phase == "channelLinks":
+                    fraction = min(0.45, 0.05 + page * 0.08)
+                    progress_bar.progress(
+                        fraction,
+                        text=f"Channel links — page {page} · {total:,} loaded",
+                    )
+                    status.caption(f"+{page_items:,} on page {page}")
+                elif phase == "locations":
+                    fraction = min(0.85, 0.50 + page * 0.08)
+                    progress_bar.progress(
+                        fraction,
+                        text=f"Locations — page {page} · {total:,} loaded",
+                    )
+                    status.caption(f"+{page_items:,} on page {page}")
+                else:
+                    progress_bar.progress(0.95, text=f"Building CSV — {total:,} channel links")
+                    status.caption("Formatting rows for download…")
+
+            try:
+                rows = export_channel_urls(
+                    account_id.strip(),
+                    progress_callback=on_fetch_progress,
+                )
+            except Exception as exc:
+                progress_bar.empty()
+                status.empty()
+                st.exception(exc)
+                st.stop()
+
+            progress_bar.progress(1.0, text=f"Done — {len(rows):,} channel links")
+            status.empty()
+
+            csv_text = channel_urls_csv_text(rows)
+            st.session_state["channel_urls_export_rows"] = rows
+            st.session_state["channel_urls_export_csv"] = csv_text
+            st.session_state["channel_urls_export_account_id"] = account_id.strip()
+            st.success(f"Fetched {len(rows)} channel links.")
+
+    if "channel_urls_export_csv" in st.session_state:
+        rows = st.session_state["channel_urls_export_rows"]
+        with_url = sum(1 for row in rows if (row.get("storeUrl") or "").strip())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Channel links", len(rows))
+        c2.metric("With store URL", with_url)
+        c3.metric("Empty store URL", len(rows) - with_url)
+
+        st.download_button(
+            label="Download CSV",
+            data=st.session_state["channel_urls_export_csv"].encode("utf-8-sig"),
+            file_name=_channel_urls_export_filename(
+                st.session_state["channel_urls_export_account_id"]
+            ),
+            mime="text/csv",
+            type="primary",
+            key="channel_urls_download",
+        )
+
+        with st.expander(f"Preview (first {PREVIEW_ROWS} rows)", expanded=True):
+            st.dataframe(rows[:PREVIEW_ROWS], use_container_width=True, hide_index=True)
+
+
+def _render_channel_urls_import(account_id: str) -> None:
+    st.subheader("Import from CSV")
+    st.markdown(
+        "Upload the same CSV format produced by export. "
+        "Only **channelLinkId** and **storeUrl** are required; other columns are for reference. "
+        "An empty **storeUrl** (or `\"\"`) clears both `storeUrl` and `menuUrl`."
+    )
+    st.warning("This patches live channel links. Double-check the CSV before importing.")
+    st.caption(f"Account: `{account_id}`")
+
+    template_rows = [
+        {
+            "locationName": "Example Store",
+            "locationId": "000000000000000000000000",
+            "channelLinkId": "000000000000000000000000",
+            "channelLinkName": "Example Channel Link",
+            "storeUrl": "https://www.ubereats.com/store/example",
+        }
+    ]
+    st.download_button(
+        label="Download CSV template",
+        data=channel_urls_csv_text(template_rows).encode("utf-8-sig"),
+        file_name="channel_urls_template.csv",
+        mime="text/csv",
+        key="channel_urls_download_template",
+        help="Fill in channel link IDs and store URLs, then upload below.",
+    )
+
+    uploaded = st.file_uploader(
+        "CSV file",
+        type=["csv"],
+        help="Must include columns: " + ", ".join(CHANNEL_URL_CSV_COLUMNS),
+        key="channel_urls_upload",
+    )
+
+    if uploaded is not None:
+        raw = uploaded.getvalue().decode("utf-8-sig")
+        try:
+            rows = parse_channel_url_csv(raw)
+        except Exception as exc:
+            st.exception(exc)
+            st.stop()
+        st.session_state["channel_urls_import_rows"] = rows
+
+    if "channel_urls_import_rows" in st.session_state:
+        rows = st.session_state["channel_urls_import_rows"]
+        valid_rows = [row for row in rows if row_has_url_update(row)]
+        skipped = len(rows) - len(valid_rows)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total rows", len(rows))
+        c2.metric("Ready to import", len(valid_rows))
+        c3.metric("Skipped (no ID)", skipped)
+
+        with st.expander(f"Preview (first {PREVIEW_ROWS} rows)", expanded=True):
+            st.dataframe(rows[:PREVIEW_ROWS], use_container_width=True, hide_index=True)
+
+        if not valid_rows:
+            st.warning(
+                "No rows are ready to import. Each row needs a channelLinkId and a storeUrl column."
+            )
+        else:
+            max_workers = st.slider(
+                "Parallel requests",
+                min_value=1,
+                max_value=50,
+                value=10,
+                key="channel_urls_max_workers",
+            )
+            confirm = st.checkbox(
+                f"I confirm I want to update **{len(valid_rows)}** channel link URL(s)",
+                key="channel_urls_confirm",
+            )
+
+            if st.button(
+                "Import channel URLs",
+                type="primary",
+                disabled=not confirm,
+                key="channel_urls_import_btn",
+            ):
+                if not account_id.strip():
+                    st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
+                else:
+                    _track_page("OS Channel URLs Import")
+                    progress = st.progress(0.0, text="Starting import…")
+                    status = st.empty()
+                    total = len(valid_rows)
+
+                    def on_import_progress(completed, total_count, result):
+                        progress.progress(
+                            completed / total_count if total_count else 1.0,
+                            text=f"Updated {completed}/{total_count}",
+                        )
+                        label = (
+                            result.get("channelLinkName")
+                            or result.get("channelLinkId")
+                            or "Unknown"
+                        )
+                        icon = "✅" if result.get("success") else "❌"
+                        status.caption(f"{icon} {label}")
+
+                    with st.spinner("Patching channel links…"):
+                        try:
+                            results = import_channel_urls(
+                                account_id.strip(),
+                                rows=valid_rows,
+                                max_workers=max_workers,
+                                on_progress=on_import_progress,
+                            )
+                        except Exception as exc:
+                            progress.empty()
+                            status.empty()
+                            st.exception(exc)
+                            st.stop()
+
+                    progress.progress(1.0, text=f"Done: {total} processed")
+                    status.empty()
+                    st.session_state["channel_urls_import_results"] = results
+
+    if st.session_state.get("channel_urls_import_results"):
+        results = st.session_state["channel_urls_import_results"]
+        success_count = sum(1 for row in results if row.get("success"))
+        failed = [row for row in results if not row.get("success")]
+        st.success(f"Updated **{success_count}** channel link(s).")
+        if failed:
+            st.error(f"**{len(failed)}** channel link(s) failed to update.")
+
+        display = []
+        for row in results:
+            display.append(
+                {
+                    "Success": row.get("success"),
+                    "Location": row.get("locationName"),
+                    "Location ID": row.get("locationId"),
+                    "Channel link": row.get("channelLinkName"),
+                    "Channel link ID": row.get("channelLinkId"),
+                    "Store URL": row.get("storeUrl"),
+                    "Error": row.get("error") or "—",
+                }
+            )
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+        result_csv = io.StringIO()
+        writer = csv.DictWriter(result_csv, fieldnames=list(display[0].keys()) if display else [])
+        writer.writeheader()
+        writer.writerows(display)
+        st.download_button(
+            label="Download import results CSV",
+            data=result_csv.getvalue().encode("utf-8-sig"),
+            file_name=f"channel_urls_import_results_{datetime.now().strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            key="channel_urls_download_import_results",
+        )
+
+
+def page_channel_urls_export() -> None:
+    st.title("Channel URLs")
+    st.caption(
+        "Export storeUrl values from all channel links, edit in Excel, then import updates back."
+    )
+    _render_channel_urls_export(_get_account_id())
+
+
+def page_channel_urls_import() -> None:
+    st.title("Channel URLs")
+    st.caption(
+        "Export storeUrl values from all channel links, edit in Excel, then import updates back."
+    )
+    _render_channel_urls_import(_get_account_id())
 
 
 def page_channel_activation() -> None:
@@ -2143,6 +2406,10 @@ pages = {
     "Opening hours": [
         st.Page(page_opening_hours_export, title="Export", icon=":material/upload:"),
         st.Page(page_opening_hours_import, title="Import", icon=":material/download:"),
+    ],
+    "Channel URLs": [
+        st.Page(page_channel_urls_export, title="Export", icon=":material/upload:"),
+        st.Page(page_channel_urls_import, title="Import", icon=":material/download:"),
     ],
     "Channel setup": [
         st.Page(
