@@ -1,5 +1,5 @@
 """
-Streamlit UI for Deliverect toolkit: retail channel setup, opening hours, and channel URLs.
+Streamlit UI for Deliverect toolkit: retail channel setup, opening hours, channel URLs, and renaming.
 
 Run from the project directory:
   streamlit run app.py
@@ -42,6 +42,18 @@ from export_import_channel_urls import (
     parse_csv as parse_channel_url_csv,
     row_has_url_update,
     to_csv_string as channel_urls_csv_text,
+)
+from rename_stores import (
+    CHANNEL_LINK_CSV_COLUMNS as RENAME_CHANNEL_CSV_COLUMNS,
+    LOCATION_CSV_COLUMNS as RENAME_LOCATION_CSV_COLUMNS,
+    apply_channel_link_name_updates,
+    apply_location_name_updates,
+    changed_channel_link_rows,
+    changed_location_rows,
+    export_channel_link_names,
+    export_location_names,
+    parse_csv as parse_rename_csv,
+    to_csv_string as rename_csv_text,
 )
 from je_cancelled_courier_export import (
     DEFAULT_DAYS as JE_CANCELLED_DEFAULT_DAYS,
@@ -407,6 +419,12 @@ def _channel_urls_export_filename(account_id: str) -> str:
     return f"channel_urls_{short_acc}_{date_str}.csv"
 
 
+def _rename_export_filename(account_id: str, kind: str) -> str:
+    short_acc = re.sub(r"[^\w]", "", account_id)[:12] or "account"
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    return f"{kind}_names_{short_acc}_{date_str}.csv"
+
+
 def _import_preview_row(detail: dict) -> dict:
     status_labels = {
         "full": "Ready (7/7)",
@@ -750,7 +768,7 @@ def _sign_out_sidebar() -> None:
         if st.button("Sign out", key="sign_out", use_container_width=True):
             st.session_state.pop("authenticated", None)
             for key in list(st.session_state.keys()):
-                if key.startswith(("busy_mode_", "je_cancelled_", "channel_urls_")):
+                if key.startswith(("busy_mode_", "je_cancelled_", "channel_urls_", "rename_")):
                     st.session_state.pop(key, None)
             st.rerun()
 
@@ -1018,6 +1036,298 @@ def page_channel_urls_import() -> None:
         "Export storeUrl values from all channel links, edit in Excel, then import updates back."
     )
     _render_channel_urls_import(_get_account_id())
+
+
+def _editor_rows(value) -> list[dict]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [dict(row) for row in value]
+    if hasattr(value, "to_dict"):
+        return value.to_dict("records")
+    return list(value)
+
+
+def _render_rename_fetch_progress():
+    progress_bar = st.progress(0.0, text="Starting…")
+    status = st.empty()
+
+    def on_fetch_progress(phase: str, page: int, page_items: int, total: int) -> None:
+        if phase == "channelLinks":
+            progress_bar.progress(
+                min(0.45, 0.05 + page * 0.08),
+                text=f"Channel links — page {page} · {total:,} loaded",
+            )
+            status.caption(f"+{page_items:,} on page {page}")
+        elif phase == "locations":
+            progress_bar.progress(
+                min(0.85, 0.50 + page * 0.08),
+                text=f"Locations — page {page} · {total:,} loaded",
+            )
+            status.caption(f"+{page_items:,} on page {page}")
+        else:
+            progress_bar.progress(0.95, text=f"Building table — {total:,} rows")
+            status.caption("Formatting rows…")
+
+    return progress_bar, status, on_fetch_progress
+
+
+def _render_rename(account_id: str) -> None:
+    st.markdown(
+        "Load current names, edit them in the table (or via CSV), then apply only the rows that changed."
+    )
+    st.warning("This patches live Deliverect names. Double-check before applying.")
+    st.caption(f"Account: `{account_id}`")
+
+    mode = st.radio(
+        "What are you renaming?",
+        options=("Locations", "Channel links"),
+        horizontal=True,
+        key="rename_mode",
+    )
+    location_mode = mode == "Locations"
+    columns = RENAME_LOCATION_CSV_COLUMNS if location_mode else RENAME_CHANNEL_CSV_COLUMNS
+    rows_key = "rename_location_rows" if location_mode else "rename_channel_rows"
+    original_key = "rename_location_original" if location_mode else "rename_channel_original"
+    nonce_key = "rename_location_nonce" if location_mode else "rename_channel_nonce"
+    editor_key = f"rename_editor_{'loc' if location_mode else 'cl'}_{st.session_state.get(nonce_key, 0)}"
+    results_key = "rename_location_results" if location_mode else "rename_channel_results"
+    name_field = "locationName" if location_mode else "channelLinkName"
+    id_field = "locationId" if location_mode else "channelLinkId"
+    upload_seen_key = f"rename_upload_seen_{'loc' if location_mode else 'cl'}"
+
+    load_clicked = st.button(
+        f"Load {mode.lower()}",
+        type="primary",
+        key="rename_load_btn",
+    )
+    if load_clicked:
+        if not account_id.strip():
+            st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
+        else:
+            _track_page(f"OS Rename {mode}")
+            progress_bar, status, on_fetch_progress = _render_rename_fetch_progress()
+            try:
+                rows = (
+                    export_location_names(account_id.strip(), progress_callback=on_fetch_progress)
+                    if location_mode
+                    else export_channel_link_names(
+                        account_id.strip(), progress_callback=on_fetch_progress
+                    )
+                )
+            except Exception as exc:
+                progress_bar.empty()
+                status.empty()
+                st.exception(exc)
+                st.stop()
+            progress_bar.progress(1.0, text=f"Done — {len(rows):,} rows")
+            status.empty()
+            st.session_state[rows_key] = rows
+            st.session_state[original_key] = [dict(row) for row in rows]
+            st.session_state[nonce_key] = st.session_state.get(nonce_key, 0) + 1
+            st.session_state.pop(results_key, None)
+            st.success(f"Loaded **{len(rows)}** {mode.lower()}.")
+            st.rerun()
+
+    uploaded = st.file_uploader(
+        "Or upload a names CSV",
+        type=["csv"],
+        help="Must include columns: " + ", ".join(columns),
+        key=f"rename_upload_{'loc' if location_mode else 'cl'}",
+    )
+    if uploaded is not None:
+        file_sig = (uploaded.name, uploaded.size)
+        if st.session_state.get(upload_seen_key) != file_sig:
+            try:
+                uploaded_rows = parse_rename_csv(uploaded.getvalue().decode("utf-8-sig"))
+            except Exception as exc:
+                st.exception(exc)
+                st.stop()
+            st.session_state[rows_key] = uploaded_rows
+            if original_key not in st.session_state:
+                st.session_state[original_key] = []
+            st.session_state[nonce_key] = st.session_state.get(nonce_key, 0) + 1
+            st.session_state.pop(results_key, None)
+            st.session_state[upload_seen_key] = file_sig
+            st.info(f"Loaded **{len(uploaded_rows)}** row(s) from CSV.")
+            st.rerun()
+
+    rows = st.session_state.get(rows_key)
+    original = st.session_state.get(original_key) or []
+    if not rows:
+        st.info(f"Load {mode.lower()} to edit names, or upload a CSV.")
+        template = (
+            [{"locationId": "000000000000000000000000", "locationName": "Onestop - Example"}]
+            if location_mode
+            else [
+                {
+                    "channelLinkId": "000000000000000000000000",
+                    "channelLinkName": "Just Eat",
+                    "locationId": "000000000000000000000000",
+                    "locationName": "Onestop - Example",
+                    "channel": "Just Eat",
+                }
+            ]
+        )
+        st.download_button(
+            label="Download CSV template",
+            data=rename_csv_text(template, columns).encode("utf-8-sig"),
+            file_name=f"{'location' if location_mode else 'channel_link'}_names_template.csv",
+            mime="text/csv",
+            key=f"rename_template_{'loc' if location_mode else 'cl'}",
+        )
+        return
+
+    column_config = {
+        col: st.column_config.TextColumn(col, disabled=col != name_field)
+        for col in columns
+    }
+
+    edited = st.data_editor(
+        rows,
+        column_config=column_config,
+        hide_index=True,
+        use_container_width=True,
+        height=480,
+        num_rows="fixed",
+        key=editor_key,
+    )
+    edited_rows = _editor_rows(edited)
+
+    changes = (
+        changed_location_rows(original, edited_rows)
+        if location_mode
+        else changed_channel_link_rows(original, edited_rows)
+    )
+
+    c1, c2 = st.columns(2)
+    c1.metric(mode, len(edited_rows))
+    c2.metric("Name changes", len(changes))
+
+    st.download_button(
+        label="Download CSV",
+        data=rename_csv_text(edited_rows, columns).encode("utf-8-sig"),
+        file_name=_rename_export_filename(
+            account_id,
+            "location" if location_mode else "channel_link",
+        ),
+        mime="text/csv",
+        key=f"rename_download_{'loc' if location_mode else 'cl'}",
+    )
+
+    if changes:
+        original_by_id = {
+            str(row.get(id_field) or "").strip(): row for row in original
+        }
+        preview = []
+        for row in changes:
+            item_id = row.get(id_field)
+            preview.append(
+                {
+                    "ID": item_id,
+                    "Current name": (original_by_id.get(str(item_id or "").strip()) or {}).get(
+                        name_field
+                    )
+                    or "",
+                    "New name": row.get(name_field) or "",
+                }
+            )
+        with st.expander(f"Pending changes ({len(changes)})", expanded=True):
+            st.dataframe(preview, use_container_width=True, hide_index=True)
+
+    max_workers = st.slider(
+        "Parallel requests",
+        min_value=1,
+        max_value=50,
+        value=10,
+        key="rename_max_workers",
+    )
+    confirm = st.checkbox(
+        f"I confirm I want to rename **{len(changes)}** {mode.lower()}",
+        key="rename_confirm",
+        disabled=not changes,
+    )
+    if st.button(
+        f"Apply {len(changes)} name change(s)",
+        type="primary",
+        disabled=not changes or not confirm,
+        key="rename_apply_btn",
+    ):
+        if not account_id.strip():
+            st.error("ACCOUNT_ID is not set. Add it to your `.env` file.")
+        else:
+            _track_page(f"OS Rename {mode} Apply")
+            progress = st.progress(0.0, text="Starting…")
+            status = st.empty()
+
+            def on_progress(completed, total, result):
+                progress.progress(
+                    completed / total if total else 1.0,
+                    text=f"Updated {completed}/{total}",
+                )
+                label = result.get("new_name") or result.get("target_id") or "Unknown"
+                icon = "✅" if result.get("success") else "❌"
+                status.caption(f"{icon} {label}")
+
+            apply_fn = (
+                apply_location_name_updates if location_mode else apply_channel_link_name_updates
+            )
+            try:
+                results = apply_fn(
+                    account_id.strip(),
+                    changes,
+                    max_workers=max_workers,
+                    on_progress=on_progress,
+                )
+            except Exception as exc:
+                progress.empty()
+                status.empty()
+                st.exception(exc)
+                st.stop()
+            progress.progress(1.0, text=f"Done: {len(results)} processed")
+            status.empty()
+            st.session_state[results_key] = results
+            st.session_state[rows_key] = [dict(row) for row in edited_rows]
+            st.session_state[original_key] = [dict(row) for row in edited_rows]
+            st.session_state[nonce_key] = st.session_state.get(nonce_key, 0) + 1
+            st.rerun()
+
+    if st.session_state.get(results_key):
+        results = st.session_state[results_key]
+        success_count = sum(1 for row in results if row.get("success"))
+        failed = [row for row in results if not row.get("success")]
+        st.success(f"Renamed **{success_count}** {mode.lower()}.")
+        if failed:
+            st.error(f"**{len(failed)}** failed.")
+        display = [
+            {
+                "Success": row.get("success"),
+                "Type": row.get("target_type"),
+                "ID": row.get("target_id"),
+                "Previous name": row.get("previous_name") or "—",
+                "New name": row.get("new_name") or "—",
+                "Error": row.get("error") or "—",
+            }
+            for row in results
+        ]
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        result_csv = io.StringIO()
+        writer = csv.DictWriter(result_csv, fieldnames=list(display[0].keys()) if display else [])
+        writer.writeheader()
+        writer.writerows(display)
+        st.download_button(
+            label="Download results CSV",
+            data=result_csv.getvalue().encode("utf-8-sig"),
+            file_name=f"rename_results_{datetime.now().strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            key=f"rename_results_download_{'loc' if location_mode else 'cl'}",
+        )
+
+
+def page_rename() -> None:
+    st.title("Rename")
+    st.caption("Change location or channel link names in Deliverect.")
+    _render_rename(_get_account_id())
 
 
 def page_channel_activation() -> None:
@@ -2410,6 +2720,9 @@ pages = {
     "Channel URLs": [
         st.Page(page_channel_urls_export, title="Export", icon=":material/upload:"),
         st.Page(page_channel_urls_import, title="Import", icon=":material/download:"),
+    ],
+    "Locations": [
+        st.Page(page_rename, title="Rename", icon=":material/edit:"),
     ],
     "Channel setup": [
         st.Page(
