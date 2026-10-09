@@ -35,7 +35,7 @@ API_BASE = "https://api.deliverect.io"
 RETRY_BASE = f"{API_BASE}/retry"
 
 # Bump when Cloud mounts look stale — Streamlit UI shows this version.
-MODULE_VERSION = "2026-10-09-retry-display-id"
+MODULE_VERSION = "2026-10-09-retry-simple"
 
 # Deliverect failed-order statuses for retail retry.
 FAILED_STATUSES = [120, 122]

@@ -113,13 +113,11 @@ RETRY_MODULE_VERSION = getattr(_retry_orders, "MODULE_VERSION", "unknown")
 _RETRY_REQUIRED_ATTRS = (
     "scan_failed_orders",
     "parse_order_ids",
-    "parse_int_list",
     "start_retry_orders_job",
     "get_retry_job",
     "cancel_retry_job",
     "clear_retry_job",
     "window_for_london_date",
-    "window_from_days",
 )
 RETRY_ORDERS_READY = all(hasattr(_retry_orders, name) for name in _RETRY_REQUIRED_ATTRS)
 
@@ -1781,223 +1779,51 @@ def _render_retry_failed_orders(account_id: str) -> None:
 
     scan_failed_orders = _retry_attr("scan_failed_orders")
     parse_order_ids = _retry_attr("parse_order_ids")
-    parse_int_list = _retry_attr("parse_int_list")
     start_retry_orders_job = _retry_attr("start_retry_orders_job")
     get_retry_job = _retry_attr("get_retry_job")
     window_for_london_date = _retry_attr("window_for_london_date")
-    window_from_days = _retry_attr("window_from_days")
 
     st.caption(f"retry module `{RETRY_MODULE_VERSION}`")
     st.markdown(
         """
-**How to use**
-1. Paste channel order display IDs and pick the date
-2. Click **Dry run** — looks them up on this account for that date (no retries)
-3. If the counts look right, confirm and click **Retry via retail**
-
-Lookup is `channelOrderDisplayId` + account + the time window. Retries go to
-`GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
+Paste channel order display IDs and pick the date. **Find orders** looks them up
+on this account for that day, any status. Then retry the ones it found.
 """
     )
     st.caption(f"Account: `{account_id}`")
-    st.warning("Retry re-pushes live orders to the POS. Always dry run first.")
 
-    st.subheader("1. Choose orders")
     id_text = st.text_area(
         "Channel order display IDs",
         height=140,
         placeholder="Comma, space, or newline separated",
         key="retry_order_ids",
-        help="Partner order numbers. Matched as channelOrderDisplayId on this account for the selected date.",
     )
     upload = st.file_uploader(
-        "Or drop a .txt or .csv of channel order display IDs",
+        "Or drop a .txt or .csv",
         type=["txt", "csv"],
         key="retry_order_id_file",
     )
     raw_ids = _retry_id_blob(id_text, upload)
-    pasted_count = len(parse_order_ids(raw_ids))
-    st.caption(
-        f"{pasted_count:,} unique channel order display ID(s). "
-        "Looked up on this account for the date below."
-    )
+    display_ids = parse_order_ids(raw_ids)
+    st.caption(f"{len(display_ids):,} unique channel order display ID(s)")
 
-    apply_window = st.checkbox(
-        "Limit to a time window",
-        value=True,
-        key="retry_apply_window",
-        help="Required when channel order display IDs are pasted. Those IDs are matched on this account for this date.",
-    )
-    if pasted_count and not apply_window:
-        st.warning(
-            "Channel order display IDs are looked up on this account for the selected date. "
-            "Turn the time window back on."
-        )
-    window_mode = st.radio(
-        "Time window",
-        options=["London calendar day", "Rolling days (UTC)", "Custom UTC"],
-        horizontal=True,
-        key="retry_failed_window_mode",
-        disabled=not apply_window,
-    )
+    day = st.date_input("Date", value=london_now().date(), key="retry_failed_day")
+    since, until = window_for_london_date(day)
+    st.caption(f"London day, UTC window `{since}` → `{until}`")
 
-    since = until = ""
-    if window_mode == "London calendar day":
-        day = st.date_input(
-            "London day",
-            value=london_now().date(),
-            key="retry_failed_day",
-            disabled=not apply_window,
-        )
-        since, until = window_for_london_date(day)
-        st.caption(f"UTC window: `{since}` → `{until}`")
-    elif window_mode == "Rolling days (UTC)":
-        days = st.number_input(
-            "Lookback (days)",
-            min_value=1,
-            max_value=89,
-            value=1,
-            step=1,
-            key="retry_failed_days",
-            disabled=not apply_window,
-        )
-        since, until = window_from_days(int(days))
-        st.caption(f"UTC window: `{since}` → `{until}`")
-    else:
-        bound_cols = st.columns(2)
-        since = bound_cols[0].text_input(
-            "Since (UTC, exclusive)",
-            key="retry_since",
-            placeholder="2026-07-15T23:00:00.000Z",
-            disabled=not apply_window,
-        ).strip()
-        until = bound_cols[1].text_input(
-            "Until (UTC, exclusive)",
-            key="retry_until",
-            placeholder="2026-07-16T22:59:59.999Z",
-            disabled=not apply_window,
-        ).strip()
-        if since and until:
-            st.caption(f"UTC window: `{since}` → `{until}`")
-
-    st.subheader("Status")
-    status_cols = st.columns(2)
-    include_raw = status_cols[0].text_input(
-        "Include statuses",
-        value="120, 122",
-        key="retry_include_statuses",
-        help="Current status must be one of these. Clear this to keep every order found for the pasted display IDs.",
-    )
-    exclude_raw = status_cols[1].text_input(
-        "Exclude statuses",
-        value="",
-        key="retry_exclude_statuses",
-        help="Drop orders whose current status is one of these.",
-    )
-    history_cols = st.columns(2)
-    hist_raw = history_cols[0].text_input(
-        "Exclude if history contains",
-        value="123",
-        key="retry_exclude_history",
-        help="Skip orders that already have any of these codes in statusHistory. 123 is Manual Retry. Clear to retry them again.",
-    )
-    req_raw = history_cols[1].text_input(
-        "Only if history contains",
-        value="",
-        key="retry_require_history",
-        help="Keep orders whose statusHistory includes any of these codes.",
-    )
-    if pasted_count and include_raw.strip():
-        st.caption(
-            "Include statuses apply after the display-ID lookup. Clear **Include statuses** "
-            "to retry every order found on this account for that date."
-        )
-
-    with st.expander("Channel and location", expanded=False):
-        channel_raw = st.text_input(
-            "Channels",
-            value="",
-            key="retry_channels",
-            help="Channel numbers, comma or space separated.",
-        )
-        location_raw = st.text_area(
-            "Location IDs",
-            key="retry_locations",
-            height=80,
-            placeholder="Comma, space, or newline separated",
-        )
-        display_raw = ""
-
-    filter_key = "|".join(
-        [
-            account_id,
-            "1" if apply_window else "0",
-            since if apply_window else "",
-            until if apply_window else "",
-            raw_ids,
-            include_raw,
-            exclude_raw,
-            hist_raw,
-            req_raw,
-            channel_raw,
-            location_raw,
-            display_raw,
-        ]
-    )
-    st.caption(
-        "Dry run counts matches and skips. It does not call `/retry`."
-    )
+    filter_key = "|".join([account_id, since, until, raw_ids])
     if st.button(
-        "Dry run — count matches",
+        "Find orders",
         type="primary",
         use_container_width=True,
         key="retry_failed_dry_run",
     ):
         _track_page("OS Retry Failed Orders Dry Run")
-        try:
-            statuses = parse_int_list(include_raw, label="include status")
-            exclude_statuses = parse_int_list(exclude_raw, label="exclude status")
-            exclude_history = parse_int_list(hist_raw, label="history status")
-            require_history = parse_int_list(req_raw, label="history status")
-            channels = parse_int_list(channel_raw, label="channel")
-            locations = parse_order_ids(location_raw)
-            display_ids = parse_order_ids(raw_ids)
-            order_ids = []
-        except ValueError as exc:
-            st.error(str(exc))
+        if not display_ids:
+            st.error("Paste at least one channel order display ID.")
             st.stop()
 
-        if display_ids and not apply_window:
-            st.error(
-                "Turn the time window on. Channel order display IDs are looked up "
-                "on this account for that date."
-            )
-            st.stop()
-        if apply_window and (not since or not until):
-            st.error("Enter both time-window bounds.")
-            st.stop()
-        if not apply_window:
-            st.error("Turn the time window on.")
-            st.stop()
-        if statuses and set(exclude_statuses) >= set(statuses):
-            st.error("Every include status is also excluded.")
-            st.stop()
-        if not (
-            statuses
-            or exclude_statuses
-            or display_ids
-            or locations
-            or channels
-        ):
-            st.error(
-                "Add channel order display IDs, an include status, an exclude status, "
-                "a location, or a channel."
-            )
-            st.stop()
-
-        use_since = since if apply_window else ""
-        use_until = until if apply_window else ""
-        progress = st.progress(0.0, text="Scanning…")
+        progress = st.progress(0.0, text="Looking up orders…")
         status = st.empty()
 
         def on_progress(msg: str) -> None:
@@ -2007,96 +1833,60 @@ Lookup is `channelOrderDisplayId` + account + the time window. Retries go to
         try:
             plan = scan_failed_orders(
                 account_id,
-                since=use_since,
-                until=use_until,
-                statuses=statuses,
-                exclude_statuses=exclude_statuses,
-                exclude_history_statuses=exclude_history,
-                require_history_statuses=require_history,
-                order_ids=order_ids,
-                location_ids=locations,
-                channels=channels,
+                since=since,
+                until=until,
+                statuses=[],
+                exclude_statuses=[],
+                exclude_history_statuses=[],
+                require_history_statuses=[],
                 channel_order_display_ids=display_ids,
                 progress_callback=on_progress,
             )
         except Exception as exc:
             progress.empty()
-            st.error(f"Dry run failed: {exc}")
+            st.error(f"Lookup failed: {exc}")
             st.stop()
 
         progress.progress(1.0, text="Done")
         st.session_state["retry_failed_orders"] = {
             "filter_key": filter_key,
-            "since": use_since,
-            "until": use_until,
+            "since": since,
+            "until": until,
             "orders": plan["orderIds"],
             "matchedTotal": plan["matchedTotal"],
-            "uniqueMatched": plan["uniqueMatched"],
             "toRetry": plan["toRetry"],
-            "skippedStatus": plan.get("skippedStatus", 0),
-            "skippedHistory": plan.get("skippedHistory", 0),
-            "skippedRequireHistory": plan.get("skippedRequireHistory", 0),
-            "skippedManualRetry": plan.get("skippedManualRetry", 0),
             "notReturned": plan.get("notReturned", 0),
             "notReturnedSample": plan.get("notReturnedSample") or [],
             "requestedOrderIds": plan.get("requestedOrderIds", 0),
-            "skipHistoryStatus": plan.get("skipHistoryStatus"),
-            "dryRun": True,
         }
         st.session_state.pop("retry_failed_results", None)
         st.session_state.pop("retry_failed_was_cancelled", None)
 
     cached = st.session_state.get("retry_failed_orders")
     if not cached:
-        st.info("Run **Dry run** to see how many orders would be retried.")
+        st.info("Paste display IDs and a date, then click **Find orders**.")
         return
 
     if cached.get("filter_key") != filter_key:
-        st.info("Filters changed — click **Dry run** again to refresh counts.")
+        st.info("The list or date changed — click **Find orders** again.")
         return
 
     orders = cached["orders"]
-    skipped_status = int(cached.get("skippedStatus") or 0)
-    skipped_history = int(
-        cached.get("skippedHistory") or cached.get("skippedManualRetry") or 0
-    )
-    skipped_require = int(cached.get("skippedRequireHistory") or 0)
-    matched = int(cached.get("matchedTotal") or 0)
-    unique_matched = int(cached.get("uniqueMatched") or 0)
-    to_retry = int(cached.get("toRetry") or len(orders))
+    found = int(cached.get("toRetry") or len(orders))
     not_returned = int(cached.get("notReturned") or 0)
     requested = int(cached.get("requestedOrderIds") or 0)
 
-    st.subheader("Dry-run results")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("API matched", f"{matched:,}")
-    m2.metric("Would retry", f"{to_retry:,}")
-    m3.metric("Skipped status", f"{skipped_status:,}")
-    m4.metric("Skipped history", f"{skipped_history:,}")
-    n1, n2, n3, n4 = st.columns(4)
-    n1.metric("Missing required history", f"{skipped_require:,}")
-    n2.metric("Not returned", f"{not_returned:,}")
-    n3.metric("Unique returned", f"{unique_matched:,}")
-    n4.metric("Display IDs", f"{requested:,}")
-    missing_note = (
-        f"{not_returned:,} display ID(s) were not on this account for that date. "
-        if requested
-        else ""
-    )
-    st.success(
-        f"**Would retry {to_retry:,}.** "
-        f"Skipped {skipped_status:,} on current status, "
-        f"{skipped_history:,} on history, "
-        f"{skipped_require:,} missing a required history status. "
-        f"{missing_note}"
-        "No `/retry` calls were made."
-    )
+    st.subheader("Orders found")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Display IDs", f"{requested:,}")
+    m2.metric("Orders found", f"{found:,}")
+    m3.metric("Not on this date", f"{not_returned:,}")
 
     sample = cached.get("notReturnedSample") or []
     if sample:
-        with st.expander(f"IDs not returned ({not_returned:,})", expanded=False):
+        with st.expander(f"Display IDs not found ({not_returned:,})", expanded=False):
             st.dataframe(
-                [{"Channel order display ID": oid} for oid in sample],
+                [{"Channel order display ID": value} for value in sample],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -2104,16 +1894,19 @@ Lookup is `channelOrderDisplayId` + account + the time window. Retries go to
                 st.caption("Showing the first 50.")
 
     if not orders:
-        st.info("Nothing to retry — no orders matched, or every match was skipped.")
+        st.info("No orders matched those display IDs on this account for that date.")
         return
 
-    with st.expander(f"Preview order IDs to retry ({len(orders):,})", expanded=False):
-        preview = [{"Order ID": oid} for oid in orders[:500]]
-        st.dataframe(preview, use_container_width=True, hide_index=True)
+    with st.expander(f"Order IDs to retry ({len(orders):,})", expanded=False):
+        st.dataframe(
+            [{"Order ID": oid} for oid in orders[:500]],
+            use_container_width=True,
+            hide_index=True,
+        )
         if len(orders) > 500:
             st.caption("Preview limited to the first 500 IDs.")
 
-    st.subheader("2. Execute retry")
+    st.subheader("Retry")
     with st.expander("Batch settings", expanded=False):
         st.slider(
             "Parallel workers per batch",
@@ -2155,6 +1948,7 @@ Lookup is `channelOrderDisplayId` + account + the time window. Retries go to
         job_snap = get_retry_job(job_id)
         job_running = bool(job_snap and not job_snap.get("done"))
 
+    st.warning("Retry re-pushes live orders to the POS.")
     if st.button(
         f"Retry {len(orders):,} via retail",
         type="primary",
@@ -2264,7 +2058,7 @@ def _render_retry_failed_job(job_id: str) -> None:
 def page_retry_failed_orders() -> None:
     st.title("Retry orders")
     st.caption(
-        "Paste channel order display IDs for this account and date, or search by status. Dry run first."
+        "Paste channel order display IDs and a date. Find the orders, then retry them."
     )
     _render_retry_failed_orders(_get_account_id())
 
