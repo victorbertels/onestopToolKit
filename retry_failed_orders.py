@@ -1,10 +1,11 @@
-"""Retry failed Deliverect retail orders via GET /retry/{orderId}.
+"""Retry Deliverect retail orders via GET /retry/{orderId}.
 
-Finds orders in failed statuses 120 / 122 for an account + time window, then
-retries each through the retail retry endpoint.
+Select orders with a pasted ID list and/or filters (status, excluded status,
+status history, channel, location, channel order display ID, time window),
+then retry each through the retail retry endpoint.
 
-Orders that already have Manual Retry (123) in ``statusHistory`` are skipped
-so we do not re-send previously retried orders.
+Orders whose ``statusHistory`` contains an excluded status (default 123,
+Manual Retry) are skipped so previously retried orders are not sent again.
 
 Order listing uses a lean projection and sequential paging so large days do
 not time out or OOM.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -33,7 +35,7 @@ API_BASE = "https://api.deliverect.io"
 RETRY_BASE = f"{API_BASE}/retry"
 
 # Bump when Cloud mounts look stale — Streamlit UI shows this version.
-MODULE_VERSION = "2026-07-17-retry-v3"
+MODULE_VERSION = "2026-10-09-retry-filters"
 
 # Deliverect failed-order statuses for retail retry.
 FAILED_STATUSES = [120, 122]
@@ -48,6 +50,18 @@ MAX_WORKERS = 10
 SLEEP_SECONDS = 60
 REQUEST_TIMEOUT = 120
 MAX_ORDER_LOOKBACK_DAYS = 89
+# Eve where-clauses go in the query string; keep each $in list small.
+ID_QUERY_CHUNK = 80
+
+_SPLIT_TOKENS = re.compile(r"[\s,;]+")
+_IGNORED_ID_TOKENS = {
+    "id",
+    "_id",
+    "orderid",
+    "order_id",
+    "channelorderdisplayid",
+    "channel_order_display_id",
+}
 
 # Lean listing projection — need statusHistory to skip already-retried orders.
 ORDER_LIST_PROJECTION = {
@@ -121,40 +135,231 @@ def _retail_headers() -> dict:
     return headers
 
 
+def parse_order_ids(raw: str) -> list[str]:
+    """Split pasted order IDs on commas, semicolons, and whitespace.
+
+    Drops blanks, duplicates, and a few common CSV header cells. Keeps order.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in _SPLIT_TOKENS.split(raw or ""):
+        value = token.strip().strip("'\"")
+        if not value or value.lower() in _IGNORED_ID_TOKENS or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def parse_int_list(raw: str, *, label: str = "number") -> list[int]:
+    """Split integers on commas, semicolons, and whitespace."""
+    seen: set[int] = set()
+    out: list[int] = []
+    for token in _SPLIT_TOKENS.split(raw or ""):
+        value = token.strip()
+        if not value:
+            continue
+        if not re.fullmatch(r"-?\d+", value):
+            raise ValueError(f"Invalid {label}: {value}")
+        number = int(value)
+        if number in seen:
+            continue
+        seen.add(number)
+        out.append(number)
+    return out
+
+
+def order_history_statuses(order: dict) -> set[int]:
+    """Status codes present in ``statusHistory``."""
+    history = order.get("statusHistory") or []
+    if not isinstance(history, list):
+        return set()
+    found: set[int] = set()
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            found.add(int(entry.get("status")))
+        except (TypeError, ValueError):
+            continue
+    return found
+
+
 def order_has_history_status(
     order: dict,
     status: int = SKIP_IF_HISTORY_STATUS,
 ) -> bool:
     """True if ``statusHistory`` contains an entry with the given status code."""
-    history = order.get("statusHistory") or []
-    if not isinstance(history, list):
-        return False
-    for entry in history:
-        if not isinstance(entry, dict):
-            continue
-        try:
-            if int(entry.get("status")) == status:
-                return True
-        except (TypeError, ValueError):
-            continue
-    return False
+    return status in order_history_statuses(order)
 
 
-def _fetch_orders_page(
+def _dedupe_strs(values: Optional[list[str]]) -> list[str]:
+    return parse_order_ids("\n".join(str(v) for v in (values or []) if str(v).strip()))
+
+
+def _chunks(values: list, size: int):
+    step = max(1, size)
+    for start in range(0, len(values), step):
+        yield values[start : start + step]
+
+
+def _mongo_eq_or_in(values: list) -> Any:
+    if len(values) == 1:
+        return values[0]
+    return {"$in": values}
+
+
+def _order_status(order: dict) -> Optional[int]:
+    try:
+        return int(order.get("status"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _skip_reason(
+    order: dict,
+    *,
+    include_statuses: set[int],
+    exclude_statuses: set[int],
+    exclude_history: set[int],
+    require_history: set[int],
+) -> Optional[str]:
+    """Why this order is not retried, or None to keep it.
+
+    ``include_statuses`` empty means current status is not restricted.
+    """
+    status = _order_status(order)
+    if include_statuses and status not in include_statuses:
+        return "status"
+    if exclude_statuses and status in exclude_statuses:
+        return "status"
+    history = order_history_statuses(order)
+    if exclude_history and history.intersection(exclude_history):
+        return "history"
+    if require_history and not history.intersection(require_history):
+        return "require_history"
+    return None
+
+
+def _build_order_where(
     account: str,
     *,
     since: str,
     until: str,
     statuses: list[int],
+    exclude_statuses: list[int],
+    channels: list[int],
+    location_ids: list[str],
+    channel_order_display_ids: list[str],
+    order_ids: list[str],
+    apply_status: bool,
+) -> dict[str, Any]:
+    where: dict[str, Any] = {"account": account}
+    if since or until:
+        created: dict[str, str] = {}
+        if since:
+            created["$gt"] = since
+        if until:
+            created["$lt"] = until
+        where["_created"] = created
+
+    if apply_status:
+        exclude_set = set(exclude_statuses)
+        include = [s for s in statuses if s not in exclude_set]
+        if statuses and exclude_statuses and not include:
+            raise ValueError("Include and exclude statuses cancel each other out.")
+        if include:
+            where["status"] = {"$in": include}
+        elif exclude_statuses:
+            where["status"] = {"$nin": exclude_statuses}
+
+    if channels:
+        where["channel"] = _mongo_eq_or_in(channels)
+    if location_ids:
+        where["location"] = _mongo_eq_or_in(location_ids)
+    if channel_order_display_ids:
+        where["channelOrderDisplayId"] = _mongo_eq_or_in(channel_order_display_ids)
+    if order_ids:
+        where["_id"] = _mongo_eq_or_in(order_ids)
+    return where
+
+
+def _large_id_list(
+    order_ids: list[str],
+    location_ids: list[str],
+    channel_order_display_ids: list[str],
+) -> Optional[tuple[str, list[str]]]:
+    candidates: list[tuple[str, list[str]]] = []
+    if len(order_ids) > ID_QUERY_CHUNK:
+        candidates.append(("_id", order_ids))
+    if len(location_ids) > ID_QUERY_CHUNK:
+        candidates.append(("location", location_ids))
+    if len(channel_order_display_ids) > ID_QUERY_CHUNK:
+        candidates.append(("channelOrderDisplayId", channel_order_display_ids))
+    if len(candidates) > 1:
+        names = ", ".join(name for name, _ in candidates)
+        raise ValueError(
+            f"Only one long ID list is supported at a time "
+            f"(over {ID_QUERY_CHUNK}): {names}."
+        )
+    return candidates[0] if candidates else None
+
+
+def _wheres_for_scan(
+    account: str,
+    *,
+    since: str,
+    until: str,
+    statuses: list[int],
+    exclude_statuses: list[int],
+    channels: list[int],
+    location_ids: list[str],
+    channel_order_display_ids: list[str],
+    order_ids: list[str],
+    apply_status: bool,
+) -> list[dict[str, Any]]:
+    large = _large_id_list(order_ids, location_ids, channel_order_display_ids)
+
+    def build(
+        oids: list[str], locs: list[str], display_ids: list[str]
+    ) -> dict[str, Any]:
+        return _build_order_where(
+            account,
+            since=since,
+            until=until,
+            statuses=statuses,
+            exclude_statuses=exclude_statuses,
+            channels=channels,
+            location_ids=locs,
+            channel_order_display_ids=display_ids,
+            order_ids=oids,
+            apply_status=apply_status,
+        )
+
+    if not large:
+        return [
+            build(order_ids, location_ids, channel_order_display_ids)
+        ]
+    field, values = large
+    wheres: list[dict[str, Any]] = []
+    for part in _chunks(values, ID_QUERY_CHUNK):
+        wheres.append(
+            build(
+                part if field == "_id" else order_ids,
+                part if field == "location" else location_ids,
+                part if field == "channelOrderDisplayId" else channel_order_display_ids,
+            )
+        )
+    return wheres
+
+
+def _fetch_orders_page(
+    where: dict,
+    *,
     page: int,
     max_results: int = PAGE_SIZE,
     projection: Optional[dict] = None,
 ) -> dict:
-    where: dict[str, Any] = {
-        "account": account,
-        "status": {"$in": statuses},
-        "_created": {"$gt": since, "$lt": until},
-    }
     proj = projection if projection is not None else ORDER_LIST_PROJECTION
     params = (
         f"where={quote(json.dumps(where, separators=(',', ':')))}"
@@ -173,41 +378,101 @@ def _fetch_orders_page(
 def scan_failed_orders(
     account: str,
     *,
-    since: str,
-    until: str,
+    since: str = "",
+    until: str = "",
     statuses: Optional[list[int]] = None,
+    exclude_statuses: Optional[list[int]] = None,
+    exclude_history_statuses: Optional[list[int]] = None,
+    require_history_statuses: Optional[list[int]] = None,
+    order_ids: Optional[list[str]] = None,
+    location_ids: Optional[list[str]] = None,
+    channels: Optional[list[int]] = None,
+    channel_order_display_ids: Optional[list[str]] = None,
     progress_callback: ProgressCallback = None,
 ) -> dict[str, Any]:
-    """Scan failed orders and return retry IDs plus skip counts (no /retry calls)."""
-    statuses = list(statuses or DEFAULT_STATUSES)
+    """Scan orders and return retry IDs plus skip counts (no /retry calls).
+
+    ``statuses=None`` keeps the default failed statuses (120, 122). Pass ``[]``
+    to leave current status unrestricted. ``exclude_history_statuses=None``
+    skips Manual Retry (123). Pass ``[]`` to retry orders that were already
+    manually retried.
+
+    Pasted ``order_ids`` are matched on this account, then status filters run
+    in-process so skip reasons stay accurate. Other searches push status
+    include/exclude into the API query.
+    """
+    since = (since or "").strip()
+    until = (until or "").strip()
+    include_statuses = list(DEFAULT_STATUSES if statuses is None else statuses)
+    excluded_statuses = [int(s) for s in (exclude_statuses or [])]
+    if exclude_history_statuses is None:
+        excluded_history = [SKIP_IF_HISTORY_STATUS]
+    else:
+        excluded_history = [int(s) for s in exclude_history_statuses]
+    required_history = [int(s) for s in (require_history_statuses or [])]
+    wanted_ids = _dedupe_strs(order_ids)
+    locations = _dedupe_strs(location_ids)
+    display_ids = _dedupe_strs(channel_order_display_ids)
+    channel_list = [int(c) for c in (channels or [])]
+
+    if not (
+        include_statuses
+        or excluded_statuses
+        or wanted_ids
+        or locations
+        or display_ids
+        or channel_list
+    ):
+        raise ValueError(
+            "Add an include status, an exclude status, order IDs, a location, "
+            "a channel, or a channel order display ID."
+        )
+    if (not since or not until) and not (wanted_ids or display_ids):
+        raise ValueError(
+            "A time window is required unless you pass order IDs or channel order display IDs."
+        )
+    if bool(since) != bool(until):
+        raise ValueError("Provide both since and until, or neither.")
 
     def log(msg: str) -> None:
         if progress_callback:
             progress_callback(msg)
 
-    page1 = _fetch_orders_page(
+    # ID lookups apply status client-side so "excluded status" is countable.
+    apply_status = not wanted_ids
+    wheres = _wheres_for_scan(
         account,
         since=since,
         until=until,
-        statuses=statuses,
-        page=1,
-        projection=ORDER_LIST_PROJECTION,
+        statuses=include_statuses,
+        exclude_statuses=excluded_statuses,
+        channels=channel_list,
+        location_ids=locations,
+        channel_order_display_ids=display_ids,
+        order_ids=wanted_ids,
+        apply_status=apply_status,
     )
-    meta = page1.get("_meta") or {}
-    total = int(meta.get("total") or 0)
-    max_results = int(meta.get("max_results") or PAGE_SIZE)
-    pages = max(1, (total + max_results - 1) // max_results) if total else 1
     log(
-        f"Found {total:,} failed order(s) (status {statuses}) — "
-        f"fetching with status/statusHistory ({pages} page(s))"
+        f"Scanning {len(wheres)} query chunk(s) — "
+        f"include status {include_statuses or 'any'}, "
+        f"exclude status {excluded_statuses or 'none'}, "
+        f"exclude history {excluded_history or 'none'}"
     )
+
+    include_set = set(include_statuses)
+    exclude_set = set(excluded_statuses)
+    exclude_history_set = set(excluded_history)
+    require_history_set = set(required_history)
 
     ids: list[str] = []
     seen: set[str] = set()
-    skipped_manual_retry = 0
+    skipped_status = 0
+    skipped_history = 0
+    skipped_require = 0
+    api_total = 0
 
     def _take(items: list) -> None:
-        nonlocal skipped_manual_retry
+        nonlocal skipped_status, skipped_history, skipped_require
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -215,48 +480,90 @@ def scan_failed_orders(
             if not oid or oid in seen:
                 continue
             seen.add(oid)
-            if order_has_history_status(item, SKIP_IF_HISTORY_STATUS):
-                skipped_manual_retry += 1
-                continue
-            ids.append(oid)
-
-    _take(page1.get("_items") or [])
-
-    for page in range(2, pages + 1):
-        data = _fetch_orders_page(
-            account,
-            since=since,
-            until=until,
-            statuses=statuses,
-            page=page,
-            max_results=max_results,
-            projection=ORDER_LIST_PROJECTION,
-        )
-        _take(data.get("_items") or [])
-        if page % 10 == 0 or page == pages:
-            log(
-                f"Fetched page {page}/{pages} "
-                f"({len(ids):,} to retry, {skipped_manual_retry:,} skipped "
-                f"with history status {SKIP_IF_HISTORY_STATUS})"
+            reason = _skip_reason(
+                item,
+                include_statuses=include_set,
+                exclude_statuses=exclude_set,
+                exclude_history=exclude_history_set,
+                require_history=require_history_set,
             )
+            if reason == "status":
+                skipped_status += 1
+                continue
+            if reason == "history":
+                skipped_history += 1
+                continue
+            if reason == "require_history":
+                skipped_require += 1
+                continue
+            ids.append(str(oid))
 
+    for index, where in enumerate(wheres, start=1):
+        page1 = _fetch_orders_page(where, page=1, projection=ORDER_LIST_PROJECTION)
+        meta = page1.get("_meta") or {}
+        total = int(meta.get("total") or 0)
+        max_results = int(meta.get("max_results") or PAGE_SIZE)
+        pages = max(1, (total + max_results - 1) // max_results) if total else 0
+        api_total += total
+        if len(wheres) == 1:
+            log(f"API matched {total:,} order(s) ({pages} page(s))")
+        else:
+            log(
+                f"Chunk {index}/{len(wheres)}: API matched {total:,} "
+                f"({pages} page(s))"
+            )
+        if pages == 0:
+            continue
+        _take(page1.get("_items") or [])
+        for page in range(2, pages + 1):
+            data = _fetch_orders_page(
+                where,
+                page=page,
+                max_results=max_results,
+                projection=ORDER_LIST_PROJECTION,
+            )
+            _take(data.get("_items") or [])
+            if page % 10 == 0 or page == pages:
+                log(
+                    f"Fetched page {page}/{pages} "
+                    f"({len(ids):,} to retry, {skipped_history:,} skipped on history, "
+                    f"{skipped_status:,} skipped on status)"
+                )
+
+    not_returned = [oid for oid in wanted_ids if oid not in seen] if wanted_ids else []
     plan = {
         "accountId": account,
         "since": since,
         "until": until,
-        "statuses": statuses,
-        "matchedTotal": total,
+        "statuses": include_statuses,
+        "excludeStatuses": excluded_statuses,
+        "excludeHistoryStatuses": excluded_history,
+        "requireHistoryStatuses": required_history,
+        "channels": channel_list,
+        "locationIds": locations,
+        "channelOrderDisplayIds": display_ids,
+        "requestedOrderIds": len(wanted_ids),
+        "matchedTotal": api_total,
         "uniqueMatched": len(seen),
         "toRetry": len(ids),
-        "skippedManualRetry": skipped_manual_retry,
-        "skipHistoryStatus": SKIP_IF_HISTORY_STATUS,
+        "skippedStatus": skipped_status,
+        "skippedHistory": skipped_history,
+        "skippedRequireHistory": skipped_require,
+        "skippedManualRetry": skipped_history,
+        "skipHistoryStatus": (
+            excluded_history[0] if len(excluded_history) == 1 else None
+        ),
+        "notReturned": len(not_returned),
+        "notReturnedSample": not_returned[:50],
         "orderIds": ids,
     }
     log(
         f"Dry-run plan: {plan['toRetry']:,} would retry, "
-        f"{plan['skippedManualRetry']:,} skipped "
-        f"(history status {SKIP_IF_HISTORY_STATUS}), "
-        f"{plan['uniqueMatched']:,} unique matched of {plan['matchedTotal']:,} reported"
+        f"{skipped_history:,} skipped on history, "
+        f"{skipped_status:,} skipped on status, "
+        f"{skipped_require:,} missing required history, "
+        f"{plan['notReturned']:,} not returned, "
+        f"{plan['uniqueMatched']:,} unique of {plan['matchedTotal']:,} reported"
     )
     return plan
 
@@ -312,14 +619,19 @@ def fetch_failed_orders(
         if progress_callback:
             progress_callback(msg)
 
-    page1 = _fetch_orders_page(
+    where = _build_order_where(
         account,
         since=since,
         until=until,
         statuses=statuses,
-        page=1,
-        projection=ORDER_PREVIEW_PROJECTION,
+        exclude_statuses=[],
+        channels=[],
+        location_ids=[],
+        channel_order_display_ids=[],
+        order_ids=[],
+        apply_status=True,
     )
+    page1 = _fetch_orders_page(where, page=1, projection=ORDER_PREVIEW_PROJECTION)
     meta = page1.get("_meta") or {}
     total = int(meta.get("total") or 0)
     max_results = int(meta.get("max_results") or PAGE_SIZE)
@@ -339,10 +651,7 @@ def fetch_failed_orders(
 
     for page in range(2, pages + 1):
         data = _fetch_orders_page(
-            account,
-            since=since,
-            until=until,
-            statuses=statuses,
+            where,
             page=page,
             max_results=max_results,
             projection=ORDER_PREVIEW_PROJECTION,
@@ -610,12 +919,55 @@ def retry_orders(
     return results
 
 
+def _result_from_plan(
+    plan: dict,
+    *,
+    dry_run: bool,
+    order_ids: list[str],
+    results: list,
+    cancelled: bool,
+) -> dict:
+    ok = sum(1 for r in results if r.get("success"))
+    return {
+        "accountId": plan["accountId"],
+        "since": plan["since"],
+        "until": plan["until"],
+        "statuses": plan["statuses"],
+        "excludeStatuses": plan.get("excludeStatuses") or [],
+        "excludeHistoryStatuses": plan.get("excludeHistoryStatuses") or [],
+        "requireHistoryStatuses": plan.get("requireHistoryStatuses") or [],
+        "dryRun": dry_run,
+        "orderCount": len(order_ids),
+        "matchedTotal": plan["matchedTotal"],
+        "uniqueMatched": plan["uniqueMatched"],
+        "toRetry": plan["toRetry"],
+        "skippedStatus": plan.get("skippedStatus", 0),
+        "skippedHistory": plan.get("skippedHistory", 0),
+        "skippedRequireHistory": plan.get("skippedRequireHistory", 0),
+        "skippedManualRetry": plan.get("skippedManualRetry", 0),
+        "skipHistoryStatus": plan.get("skipHistoryStatus"),
+        "notReturned": plan.get("notReturned", 0),
+        "successCount": ok,
+        "failureCount": len(results) - ok,
+        "orderIds": order_ids,
+        "results": results,
+        "cancelled": cancelled,
+    }
+
+
 def run_retry_failed_orders(
     account: str,
     *,
-    since: str,
-    until: str,
+    since: str = "",
+    until: str = "",
     statuses: Optional[list[int]] = None,
+    exclude_statuses: Optional[list[int]] = None,
+    exclude_history_statuses: Optional[list[int]] = None,
+    require_history_statuses: Optional[list[int]] = None,
+    order_ids: Optional[list[str]] = None,
+    location_ids: Optional[list[str]] = None,
+    channels: Optional[list[int]] = None,
+    channel_order_display_ids: Optional[list[str]] = None,
     dry_run: bool = False,
     max_workers: int = MAX_WORKERS,
     batch_size: int = BATCH_SIZE,
@@ -623,39 +975,34 @@ def run_retry_failed_orders(
     progress_callback: ProgressCallback = None,
     should_cancel: CancelCheck = None,
 ) -> dict:
-    """Scan failed orders (with skip stats) and optionally retry them."""
-    statuses = list(statuses or DEFAULT_STATUSES)
+    """Scan orders (with skip stats) and optionally retry them."""
     plan = scan_failed_orders(
         account,
         since=since,
         until=until,
         statuses=statuses,
+        exclude_statuses=exclude_statuses,
+        exclude_history_statuses=exclude_history_statuses,
+        require_history_statuses=require_history_statuses,
+        order_ids=order_ids,
+        location_ids=location_ids,
+        channels=channels,
+        channel_order_display_ids=channel_order_display_ids,
         progress_callback=progress_callback,
     )
-    order_ids = list(plan["orderIds"])
+    matched_ids = list(plan["orderIds"])
     if should_cancel and should_cancel():
         if progress_callback:
             progress_callback("Cancelled before retries started")
-        return {
-            "accountId": account,
-            "since": since,
-            "until": until,
-            "statuses": statuses,
-            "dryRun": dry_run,
-            "orderCount": len(order_ids),
-            "matchedTotal": plan["matchedTotal"],
-            "uniqueMatched": plan["uniqueMatched"],
-            "toRetry": plan["toRetry"],
-            "skippedManualRetry": plan["skippedManualRetry"],
-            "skipHistoryStatus": plan["skipHistoryStatus"],
-            "successCount": 0,
-            "failureCount": 0,
-            "orderIds": order_ids,
-            "results": [],
-            "cancelled": True,
-        }
+        return _result_from_plan(
+            plan,
+            dry_run=dry_run,
+            order_ids=matched_ids,
+            results=[],
+            cancelled=True,
+        )
     results = retry_orders(
-        order_ids,
+        matched_ids,
         dry_run=dry_run,
         max_workers=max_workers,
         batch_size=batch_size,
@@ -663,27 +1010,14 @@ def run_retry_failed_orders(
         progress_callback=progress_callback,
         should_cancel=should_cancel,
     )
-    ok = sum(1 for r in results if r.get("success"))
-    fail = len(results) - ok
     cancelled = bool(should_cancel and should_cancel())
-    return {
-        "accountId": account,
-        "since": since,
-        "until": until,
-        "statuses": statuses,
-        "dryRun": dry_run,
-        "orderCount": len(order_ids),
-        "matchedTotal": plan["matchedTotal"],
-        "uniqueMatched": plan["uniqueMatched"],
-        "toRetry": plan["toRetry"],
-        "skippedManualRetry": plan["skippedManualRetry"],
-        "skipHistoryStatus": plan["skipHistoryStatus"],
-        "successCount": ok,
-        "failureCount": fail,
-        "orderIds": order_ids,
-        "results": results,
-        "cancelled": cancelled,
-    }
+    return _result_from_plan(
+        plan,
+        dry_run=dry_run,
+        order_ids=matched_ids,
+        results=results,
+        cancelled=cancelled,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -798,8 +1132,8 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(
         description=(
-            "List failed retail orders (status 120/122) and retry them via "
-            "GET /retry/{orderId} with X-Deliverect-Version: retail."
+            "Find retail orders and retry them via GET /retry/{orderId} "
+            "with X-Deliverect-Version: retail."
         )
     )
     parser.add_argument(
@@ -810,7 +1144,7 @@ def main() -> None:
     parser.add_argument(
         "--date",
         default="",
-        help="London calendar day YYYY-MM-DD (uses toolkit day window). Default: today London.",
+        help="London calendar day YYYY-MM-DD (uses toolkit day window). Default: today London, unless order IDs are passed.",
     )
     parser.add_argument(
         "--days",
@@ -829,11 +1163,75 @@ def main() -> None:
         help="UTC ISO upper bound (use with --since)",
     )
     parser.add_argument(
+        "--order-ids",
+        default="",
+        help="Order IDs separated by commas, spaces, or newlines",
+    )
+    parser.add_argument(
+        "--order-id",
+        action="append",
+        default=[],
+        help="Order ID (repeatable)",
+    )
+    parser.add_argument(
         "--status",
         type=int,
         action="append",
         dest="statuses",
-        help=f"Failed status filter (repeatable; default: {DEFAULT_STATUSES})",
+        help=(
+            f"Include current status (repeatable; default {DEFAULT_STATUSES} "
+            "when no order IDs are passed)"
+        ),
+    )
+    parser.add_argument(
+        "--exclude-status",
+        type=int,
+        action="append",
+        dest="exclude_statuses",
+        help="Drop orders whose current status is this code (repeatable)",
+    )
+    parser.add_argument(
+        "--exclude-history-status",
+        type=int,
+        action="append",
+        dest="exclude_history_statuses",
+        help=(
+            "Skip orders whose statusHistory contains this code "
+            f"(repeatable; default {SKIP_IF_HISTORY_STATUS})"
+        ),
+    )
+    parser.add_argument(
+        "--include-retried",
+        action="store_true",
+        help=f"Do not skip history status {SKIP_IF_HISTORY_STATUS} (Manual Retry)",
+    )
+    parser.add_argument(
+        "--require-history-status",
+        type=int,
+        action="append",
+        dest="require_history_statuses",
+        help="Keep only orders whose history contains this code (repeatable, any match)",
+    )
+    parser.add_argument(
+        "--channel",
+        type=int,
+        action="append",
+        dest="channels",
+        help="Channel id (repeatable)",
+    )
+    parser.add_argument(
+        "--location",
+        action="append",
+        default=[],
+        dest="locations",
+        help="Location ID (repeatable, or comma-separated)",
+    )
+    parser.add_argument(
+        "--channel-order-id",
+        action="append",
+        default=[],
+        dest="channel_order_ids",
+        help="channelOrderDisplayId (repeatable, or comma-separated)",
     )
     parser.add_argument(
         "--dry-run",
@@ -868,12 +1266,21 @@ def main() -> None:
     account = _resolve_account_id(args.account)
     since = (args.since or "").strip()
     until = (args.until or "").strip()
+    order_ids = parse_order_ids(args.order_ids)
+    order_ids.extend(parse_order_ids("\n".join(args.order_id or [])))
+    order_ids = parse_order_ids("\n".join(order_ids))
+    location_ids = parse_order_ids("\n".join(args.locations or []))
+    display_ids = parse_order_ids("\n".join(args.channel_order_ids or []))
 
     if (since and not until) or (until and not since):
         print("Provide both --since and --until, or neither.", file=sys.stderr)
         sys.exit(1)
 
-    if since and until:
+    explicit_window = bool(since or until or args.days or (args.date or "").strip())
+    specific_ids = bool(order_ids or display_ids)
+    if specific_ids and not explicit_window:
+        since, until = "", ""
+    elif since and until:
         pass
     elif args.days:
         try:
@@ -888,6 +1295,20 @@ def main() -> None:
             else london_now().date()
         )
         since, until = window_for_london_date(day)
+
+    if args.statuses is not None:
+        statuses = args.statuses
+    elif specific_ids:
+        statuses = []
+    else:
+        statuses = None
+
+    if args.include_retried:
+        exclude_history = list(args.exclude_history_statuses or [])
+    elif args.exclude_history_statuses:
+        exclude_history = list(args.exclude_history_statuses)
+    else:
+        exclude_history = None
 
     dry_run = bool(args.dry_run) or not args.execute
     if not args.execute and not args.dry_run:
@@ -904,7 +1325,14 @@ def main() -> None:
             account,
             since=since,
             until=until,
-            statuses=args.statuses,
+            statuses=statuses,
+            exclude_statuses=args.exclude_statuses,
+            exclude_history_statuses=exclude_history,
+            require_history_statuses=args.require_history_statuses,
+            order_ids=order_ids,
+            location_ids=location_ids,
+            channels=args.channels,
+            channel_order_display_ids=display_ids,
             dry_run=dry_run,
             max_workers=args.workers,
             batch_size=args.batch_size,
@@ -926,7 +1354,13 @@ def main() -> None:
         "matchedTotal": result.get("matchedTotal"),
         "uniqueMatched": result.get("uniqueMatched"),
         "toRetry": result.get("toRetry", result["orderCount"]),
+        "skippedStatus": result.get("skippedStatus"),
+        "skippedHistory": result.get("skippedHistory"),
+        "skippedRequireHistory": result.get("skippedRequireHistory"),
         "skippedManualRetry": result.get("skippedManualRetry"),
+        "notReturned": result.get("notReturned"),
+        "excludeStatuses": result.get("excludeStatuses"),
+        "excludeHistoryStatuses": result.get("excludeHistoryStatuses"),
         "skipHistoryStatus": result.get("skipHistoryStatus"),
         "orderCount": result["orderCount"],
         "successCount": result["successCount"],

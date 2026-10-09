@@ -112,6 +112,8 @@ RETRY_SKIP_HISTORY_STATUS = getattr(_retry_orders, "SKIP_IF_HISTORY_STATUS", 123
 RETRY_MODULE_VERSION = getattr(_retry_orders, "MODULE_VERSION", "unknown")
 _RETRY_REQUIRED_ATTRS = (
     "scan_failed_orders",
+    "parse_order_ids",
+    "parse_int_list",
     "start_retry_orders_job",
     "get_retry_job",
     "cancel_retry_job",
@@ -1756,6 +1758,13 @@ def page_je_cancelled_courier_export() -> None:
     _render_je_cancelled_courier_export(_get_account_id())
 
 
+def _retry_id_blob(text: str, upload) -> str:
+    parts = [text or ""]
+    if upload is not None:
+        parts.append(upload.getvalue().decode("utf-8", errors="replace"))
+    return "\n".join(parts)
+
+
 def _render_retry_failed_orders(account_id: str) -> None:
     if not account_id:
         st.error("ACCOUNT_ID is not configured. Set it in the environment or vault.")
@@ -1771,10 +1780,10 @@ def _render_retry_failed_orders(account_id: str) -> None:
         st.stop()
 
     scan_failed_orders = _retry_attr("scan_failed_orders")
+    parse_order_ids = _retry_attr("parse_order_ids")
+    parse_int_list = _retry_attr("parse_int_list")
     start_retry_orders_job = _retry_attr("start_retry_orders_job")
     get_retry_job = _retry_attr("get_retry_job")
-    cancel_retry_job = _retry_attr("cancel_retry_job")
-    clear_retry_job = _retry_attr("clear_retry_job")
     window_for_london_date = _retry_attr("window_for_london_date")
     window_from_days = _retry_attr("window_from_days")
 
@@ -1782,25 +1791,50 @@ def _render_retry_failed_orders(account_id: str) -> None:
     st.markdown(
         """
 **How to use**
-1. Pick a time window  
-2. Click **Dry run** — scan only (no retries). See matched / would-retry / skipped  
-3. If the counts look right, confirm and click **Retry all via retail**
+1. Paste order IDs, or leave that empty and set filters
+2. Click **Dry run** — scan only (no retries)
+3. If the counts look right, confirm and click **Retry via retail**
 
-Queries failed statuses **120** and **122**. Skips any order that already has
-**123** (Manual Retry) in `statusHistory`. Retries go to
-`GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
+Retries go to `GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
 """
     )
     st.caption(f"Account: `{account_id}`")
-    st.warning(
-        "Retry re-pushes live orders to the POS. Always Dry run first."
-    )
+    st.warning("Retry re-pushes live orders to the POS. Always dry run first.")
 
+    st.subheader("1. Choose orders")
+    id_text = st.text_area(
+        "Order IDs",
+        height=140,
+        placeholder="Comma, space, or newline separated",
+        key="retry_order_ids",
+        help="Deliverect order _id values. Leave empty to search by the filters below.",
+    )
+    upload = st.file_uploader(
+        "Or drop a .txt or .csv of order IDs",
+        type=["txt", "csv"],
+        key="retry_order_id_file",
+    )
+    raw_ids = _retry_id_blob(id_text, upload)
+    pasted_count = len(parse_order_ids(raw_ids))
+    st.caption(f"{pasted_count:,} unique order ID(s)")
+
+    apply_window = st.checkbox(
+        "Limit to a time window",
+        value=True,
+        key="retry_apply_window",
+        help="Uncheck this when a pasted ID list should ignore the dates.",
+    )
+    if pasted_count and apply_window:
+        st.caption(
+            "The time window is on, so only pasted IDs created in that window are kept. "
+            "Uncheck **Limit to a time window** to use the full list."
+        )
     window_mode = st.radio(
         "Time window",
-        options=["London calendar day", "Rolling days (UTC)"],
+        options=["London calendar day", "Rolling days (UTC)", "Custom UTC"],
         horizontal=True,
         key="retry_failed_window_mode",
+        disabled=not apply_window,
     )
 
     since = until = ""
@@ -1809,10 +1843,11 @@ Queries failed statuses **120** and **122**. Skips any order that already has
             "London day",
             value=london_now().date(),
             key="retry_failed_day",
+            disabled=not apply_window,
         )
         since, until = window_for_london_date(day)
         st.caption(f"UTC window: `{since}` → `{until}`")
-    else:
+    elif window_mode == "Rolling days (UTC)":
         days = st.number_input(
             "Lookback (days)",
             min_value=1,
@@ -1820,24 +1855,148 @@ Queries failed statuses **120** and **122**. Skips any order that already has
             value=1,
             step=1,
             key="retry_failed_days",
+            disabled=not apply_window,
         )
         since, until = window_from_days(int(days))
         st.caption(f"UTC window: `{since}` → `{until}`")
+    else:
+        bound_cols = st.columns(2)
+        since = bound_cols[0].text_input(
+            "Since (UTC, exclusive)",
+            key="retry_since",
+            placeholder="2026-07-15T23:00:00.000Z",
+            disabled=not apply_window,
+        ).strip()
+        until = bound_cols[1].text_input(
+            "Until (UTC, exclusive)",
+            key="retry_until",
+            placeholder="2026-07-16T22:59:59.999Z",
+            disabled=not apply_window,
+        ).strip()
+        if since and until:
+            st.caption(f"UTC window: `{since}` → `{until}`")
 
-    filter_key = f"{account_id}|{since}|{until}"
-    st.subheader("1. Dry run (scan only)")
+    st.subheader("Status")
+    status_cols = st.columns(2)
+    include_raw = status_cols[0].text_input(
+        "Include statuses",
+        value="120, 122",
+        key="retry_include_statuses",
+        help="Current status must be one of these. Clear this when pasted IDs should be retried regardless of status.",
+    )
+    exclude_raw = status_cols[1].text_input(
+        "Exclude statuses",
+        value="",
+        key="retry_exclude_statuses",
+        help="Drop orders whose current status is one of these.",
+    )
+    history_cols = st.columns(2)
+    hist_raw = history_cols[0].text_input(
+        "Exclude if history contains",
+        value="123",
+        key="retry_exclude_history",
+        help="Skip orders that already have any of these codes in statusHistory. 123 is Manual Retry. Clear to retry them again.",
+    )
+    req_raw = history_cols[1].text_input(
+        "Only if history contains",
+        value="",
+        key="retry_require_history",
+        help="Keep orders whose statusHistory includes any of these codes.",
+    )
+    if pasted_count and include_raw.strip():
+        st.caption(
+            "Include statuses apply to pasted IDs. Clear **Include statuses** "
+            "to retry every pasted ID that is still on this account."
+        )
+
+    with st.expander("Channel, location, channel order ID", expanded=False):
+        channel_raw = st.text_input(
+            "Channels",
+            value="",
+            key="retry_channels",
+            help="Channel numbers, comma or space separated.",
+        )
+        location_raw = st.text_area(
+            "Location IDs",
+            key="retry_locations",
+            height=80,
+            placeholder="Comma, space, or newline separated",
+        )
+        display_raw = st.text_area(
+            "Channel order display IDs",
+            key="retry_display_ids",
+            height=80,
+            placeholder="Comma, space, or newline separated",
+            help="Partner-facing order numbers (channelOrderDisplayId).",
+        )
+
+    filter_key = "|".join(
+        [
+            account_id,
+            "1" if apply_window else "0",
+            since if apply_window else "",
+            until if apply_window else "",
+            raw_ids,
+            include_raw,
+            exclude_raw,
+            hist_raw,
+            req_raw,
+            channel_raw,
+            location_raw,
+            display_raw,
+        ]
+    )
     st.caption(
-        "Counts how many failed orders match, how many would be retried, and how many "
-        f"are skipped because history already contains status **{RETRY_SKIP_HISTORY_STATUS}**. "
-        "Does **not** call `/retry`."
+        "Dry run counts matches and skips. It does not call `/retry`."
     )
     if st.button(
-        "Dry run — count retry vs skip",
+        "Dry run — count matches",
         type="primary",
         use_container_width=True,
         key="retry_failed_dry_run",
     ):
         _track_page("OS Retry Failed Orders Dry Run")
+        try:
+            statuses = parse_int_list(include_raw, label="include status")
+            exclude_statuses = parse_int_list(exclude_raw, label="exclude status")
+            exclude_history = parse_int_list(hist_raw, label="history status")
+            require_history = parse_int_list(req_raw, label="history status")
+            channels = parse_int_list(channel_raw, label="channel")
+            locations = parse_order_ids(location_raw)
+            display_ids = parse_order_ids(display_raw)
+            order_ids = parse_order_ids(raw_ids)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+
+        specific_ids = bool(order_ids or display_ids)
+        if apply_window and (not since or not until):
+            st.error("Enter both time-window bounds, or turn the time window off.")
+            st.stop()
+        if not apply_window and not specific_ids:
+            st.error(
+                "Turn the time window on, or paste order IDs / channel order display IDs."
+            )
+            st.stop()
+        if statuses and set(exclude_statuses) >= set(statuses):
+            st.error("Every include status is also excluded.")
+            st.stop()
+        if not (
+            statuses
+            or exclude_statuses
+            or order_ids
+            or locations
+            or display_ids
+            or channels
+        ):
+            st.error(
+                "Add an include status, an exclude status, order IDs, a location, "
+                "a channel, or a channel order display ID."
+            )
+            st.stop()
+
+        use_since = since if apply_window else ""
+        use_until = until if apply_window else ""
         progress = st.progress(0.0, text="Scanning…")
         status = st.empty()
 
@@ -1848,8 +2007,16 @@ Queries failed statuses **120** and **122**. Skips any order that already has
         try:
             plan = scan_failed_orders(
                 account_id,
-                since=since,
-                until=until,
+                since=use_since,
+                until=use_until,
+                statuses=statuses,
+                exclude_statuses=exclude_statuses,
+                exclude_history_statuses=exclude_history,
+                require_history_statuses=require_history,
+                order_ids=order_ids,
+                location_ids=locations,
+                channels=channels,
+                channel_order_display_ids=display_ids,
                 progress_callback=on_progress,
             )
         except Exception as exc:
@@ -1860,14 +2027,20 @@ Queries failed statuses **120** and **122**. Skips any order that already has
         progress.progress(1.0, text="Done")
         st.session_state["retry_failed_orders"] = {
             "filter_key": filter_key,
-            "since": since,
-            "until": until,
+            "since": use_since,
+            "until": use_until,
             "orders": plan["orderIds"],
             "matchedTotal": plan["matchedTotal"],
             "uniqueMatched": plan["uniqueMatched"],
             "toRetry": plan["toRetry"],
-            "skippedManualRetry": plan["skippedManualRetry"],
-            "skipHistoryStatus": plan["skipHistoryStatus"],
+            "skippedStatus": plan.get("skippedStatus", 0),
+            "skippedHistory": plan.get("skippedHistory", 0),
+            "skippedRequireHistory": plan.get("skippedRequireHistory", 0),
+            "skippedManualRetry": plan.get("skippedManualRetry", 0),
+            "notReturned": plan.get("notReturned", 0),
+            "notReturnedSample": plan.get("notReturnedSample") or [],
+            "requestedOrderIds": plan.get("requestedOrderIds", 0),
+            "skipHistoryStatus": plan.get("skipHistoryStatus"),
             "dryRun": True,
         }
         st.session_state.pop("retry_failed_results", None)
@@ -1875,36 +2048,58 @@ Queries failed statuses **120** and **122**. Skips any order that already has
 
     cached = st.session_state.get("retry_failed_orders")
     if not cached:
-        st.info("Run **Dry run** to see matched / would-retry / skipped counts.")
+        st.info("Run **Dry run** to see how many orders would be retried.")
         return
 
     if cached.get("filter_key") != filter_key:
-        st.info("Window changed — click **Dry run** again to refresh counts.")
+        st.info("Filters changed — click **Dry run** again to refresh counts.")
         return
 
     orders = cached["orders"]
-    skipped = int(cached.get("skippedManualRetry") or 0)
+    skipped_status = int(cached.get("skippedStatus") or 0)
+    skipped_history = int(
+        cached.get("skippedHistory") or cached.get("skippedManualRetry") or 0
+    )
+    skipped_require = int(cached.get("skippedRequireHistory") or 0)
     matched = int(cached.get("matchedTotal") or 0)
-    unique_matched = int(cached.get("uniqueMatched") or len(orders) + skipped)
+    unique_matched = int(cached.get("uniqueMatched") or 0)
     to_retry = int(cached.get("toRetry") or len(orders))
-    skip_status = cached.get("skipHistoryStatus", RETRY_SKIP_HISTORY_STATUS)
+    not_returned = int(cached.get("notReturned") or 0)
+    requested = int(cached.get("requestedOrderIds") or 0)
 
     st.subheader("Dry-run results")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("API matched (120/122)", f"{matched:,}")
-    m2.metric("Unique matched", f"{unique_matched:,}")
-    m3.metric("Would retry", f"{to_retry:,}")
-    m4.metric(f"Skipped (history {skip_status})", f"{skipped:,}")
+    m1.metric("API matched", f"{matched:,}")
+    m2.metric("Would retry", f"{to_retry:,}")
+    m3.metric("Skipped status", f"{skipped_status:,}")
+    m4.metric("Skipped history", f"{skipped_history:,}")
+    n1, n2, n3, n4 = st.columns(4)
+    n1.metric("Missing required history", f"{skipped_require:,}")
+    n2.metric("Not returned", f"{not_returned:,}")
+    n3.metric("Unique returned", f"{unique_matched:,}")
+    n4.metric("Pasted IDs", f"{requested:,}")
     st.success(
-        f"**Would retry {to_retry:,}** · **skip {skipped:,}** "
-        f"(already had Manual Retry / status {skip_status} in history). "
+        f"**Would retry {to_retry:,}.** "
+        f"Skipped {skipped_status:,} on current status, "
+        f"{skipped_history:,} on history, "
+        f"{skipped_require:,} missing a required history status. "
+        f"{not_returned:,} ID(s) were not returned for this account. "
         "No `/retry` calls were made."
     )
 
+    sample = cached.get("notReturnedSample") or []
+    if sample:
+        with st.expander(f"IDs not returned ({not_returned:,})", expanded=False):
+            st.dataframe(
+                [{"Order ID": oid} for oid in sample],
+                use_container_width=True,
+                hide_index=True,
+            )
+            if not_returned > len(sample):
+                st.caption("Showing the first 50.")
+
     if not orders:
-        st.info(
-            "Nothing to retry — all matched orders were skipped, or none matched."
-        )
+        st.info("Nothing to retry — no orders matched, or every match was skipped.")
         return
 
     with st.expander(f"Preview order IDs to retry ({len(orders):,})", expanded=False):
@@ -1915,7 +2110,7 @@ Queries failed statuses **120** and **122**. Skips any order that already has
 
     st.subheader("2. Execute retry")
     with st.expander("Batch settings", expanded=False):
-        max_workers = st.slider(
+        st.slider(
             "Parallel workers per batch",
             min_value=1,
             max_value=16,
@@ -1923,7 +2118,7 @@ Queries failed statuses **120** and **122**. Skips any order that already has
             key="retry_failed_workers",
         )
         c_batch, c_sleep = st.columns(2)
-        batch_size = c_batch.number_input(
+        c_batch.number_input(
             "Batch size",
             min_value=1,
             max_value=5000,
@@ -1932,7 +2127,7 @@ Queries failed statuses **120** and **122**. Skips any order that already has
             key="retry_failed_batch_size",
             help="Orders per batch before pausing.",
         )
-        sleep_seconds = c_sleep.number_input(
+        c_sleep.number_input(
             "Sleep between batches (s)",
             min_value=0,
             max_value=600,
@@ -1941,7 +2136,6 @@ Queries failed statuses **120** and **122**. Skips any order that already has
             key="retry_failed_sleep",
         )
 
-    # Defaults when expander not opened yet this session — widgets still run above.
     max_workers = st.session_state.get("retry_failed_workers", RETRY_MAX_WORKERS)
     batch_size = st.session_state.get("retry_failed_batch_size", RETRY_BATCH_SIZE)
     sleep_seconds = st.session_state.get("retry_failed_sleep", RETRY_SLEEP_SECONDS)
@@ -2063,9 +2257,9 @@ def _render_retry_failed_job(job_id: str) -> None:
 
 
 def page_retry_failed_orders() -> None:
-    st.title("Retry failed orders")
+    st.title("Retry orders")
     st.caption(
-        "Dry run first (status 120 / 122) · skip already manually retried (123 in history)."
+        "Paste order IDs or search by status, history, channel, and location. Dry run first."
     )
     _render_retry_failed_orders(_get_account_id())
 
@@ -2748,7 +2942,7 @@ pages = {
         ),
         st.Page(
             page_retry_failed_orders,
-            title="Retry failed (dry run)",
+            title="Retry orders",
             icon=":material/replay:",
         ),
     ],
