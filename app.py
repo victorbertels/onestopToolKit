@@ -1791,11 +1791,12 @@ def _render_retry_failed_orders(account_id: str) -> None:
     st.markdown(
         """
 **How to use**
-1. Paste order IDs, or leave that empty and set filters
-2. Click **Dry run** — scan only (no retries)
+1. Paste channel order display IDs and pick the date
+2. Click **Dry run** — looks them up on this account for that date (no retries)
 3. If the counts look right, confirm and click **Retry via retail**
 
-Retries go to `GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
+Lookup is `channelOrderDisplayId` + account + the time window. Retries go to
+`GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
 """
     )
     st.caption(f"Account: `{account_id}`")
@@ -1803,31 +1804,34 @@ Retries go to `GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
 
     st.subheader("1. Choose orders")
     id_text = st.text_area(
-        "Order IDs",
+        "Channel order display IDs",
         height=140,
         placeholder="Comma, space, or newline separated",
         key="retry_order_ids",
-        help="Deliverect order _id values. Leave empty to search by the filters below.",
+        help="Partner order numbers. Matched as channelOrderDisplayId on this account for the selected date.",
     )
     upload = st.file_uploader(
-        "Or drop a .txt or .csv of order IDs",
+        "Or drop a .txt or .csv of channel order display IDs",
         type=["txt", "csv"],
         key="retry_order_id_file",
     )
     raw_ids = _retry_id_blob(id_text, upload)
     pasted_count = len(parse_order_ids(raw_ids))
-    st.caption(f"{pasted_count:,} unique order ID(s)")
+    st.caption(
+        f"{pasted_count:,} unique channel order display ID(s). "
+        "Looked up on this account for the date below."
+    )
 
     apply_window = st.checkbox(
         "Limit to a time window",
         value=True,
         key="retry_apply_window",
-        help="Uncheck this when a pasted ID list should ignore the dates.",
+        help="Required when channel order display IDs are pasted. Those IDs are matched on this account for this date.",
     )
-    if pasted_count and apply_window:
-        st.caption(
-            "The time window is on, so only pasted IDs created in that window are kept. "
-            "Uncheck **Limit to a time window** to use the full list."
+    if pasted_count and not apply_window:
+        st.warning(
+            "Channel order display IDs are looked up on this account for the selected date. "
+            "Turn the time window back on."
         )
     window_mode = st.radio(
         "Time window",
@@ -1882,7 +1886,7 @@ Retries go to `GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
         "Include statuses",
         value="120, 122",
         key="retry_include_statuses",
-        help="Current status must be one of these. Clear this when pasted IDs should be retried regardless of status.",
+        help="Current status must be one of these. Clear this to keep every order found for the pasted display IDs.",
     )
     exclude_raw = status_cols[1].text_input(
         "Exclude statuses",
@@ -1905,11 +1909,11 @@ Retries go to `GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
     )
     if pasted_count and include_raw.strip():
         st.caption(
-            "Include statuses apply to pasted IDs. Clear **Include statuses** "
-            "to retry every pasted ID that is still on this account."
+            "Include statuses apply after the display-ID lookup. Clear **Include statuses** "
+            "to retry every order found on this account for that date."
         )
 
-    with st.expander("Channel, location, channel order ID", expanded=False):
+    with st.expander("Channel and location", expanded=False):
         channel_raw = st.text_input(
             "Channels",
             value="",
@@ -1922,13 +1926,7 @@ Retries go to `GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
             height=80,
             placeholder="Comma, space, or newline separated",
         )
-        display_raw = st.text_area(
-            "Channel order display IDs",
-            key="retry_display_ids",
-            height=80,
-            placeholder="Comma, space, or newline separated",
-            help="Partner-facing order numbers (channelOrderDisplayId).",
-        )
+        display_raw = ""
 
     filter_key = "|".join(
         [
@@ -1963,20 +1961,23 @@ Retries go to `GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
             require_history = parse_int_list(req_raw, label="history status")
             channels = parse_int_list(channel_raw, label="channel")
             locations = parse_order_ids(location_raw)
-            display_ids = parse_order_ids(display_raw)
-            order_ids = parse_order_ids(raw_ids)
+            display_ids = parse_order_ids(raw_ids)
+            order_ids = []
         except ValueError as exc:
             st.error(str(exc))
             st.stop()
 
-        specific_ids = bool(order_ids or display_ids)
-        if apply_window and (not since or not until):
-            st.error("Enter both time-window bounds, or turn the time window off.")
-            st.stop()
-        if not apply_window and not specific_ids:
+        if display_ids and not apply_window:
             st.error(
-                "Turn the time window on, or paste order IDs / channel order display IDs."
+                "Turn the time window on. Channel order display IDs are looked up "
+                "on this account for that date."
             )
+            st.stop()
+        if apply_window and (not since or not until):
+            st.error("Enter both time-window bounds.")
+            st.stop()
+        if not apply_window:
+            st.error("Turn the time window on.")
             st.stop()
         if statuses and set(exclude_statuses) >= set(statuses):
             st.error("Every include status is also excluded.")
@@ -1984,14 +1985,13 @@ Retries go to `GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
         if not (
             statuses
             or exclude_statuses
-            or order_ids
-            or locations
             or display_ids
+            or locations
             or channels
         ):
             st.error(
-                "Add an include status, an exclude status, order IDs, a location, "
-                "a channel, or a channel order display ID."
+                "Add channel order display IDs, an include status, an exclude status, "
+                "a location, or a channel."
             )
             st.stop()
 
@@ -2077,13 +2077,18 @@ Retries go to `GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
     n1.metric("Missing required history", f"{skipped_require:,}")
     n2.metric("Not returned", f"{not_returned:,}")
     n3.metric("Unique returned", f"{unique_matched:,}")
-    n4.metric("Pasted IDs", f"{requested:,}")
+    n4.metric("Display IDs", f"{requested:,}")
+    missing_note = (
+        f"{not_returned:,} display ID(s) were not on this account for that date. "
+        if requested
+        else ""
+    )
     st.success(
         f"**Would retry {to_retry:,}.** "
         f"Skipped {skipped_status:,} on current status, "
         f"{skipped_history:,} on history, "
         f"{skipped_require:,} missing a required history status. "
-        f"{not_returned:,} ID(s) were not returned for this account. "
+        f"{missing_note}"
         "No `/retry` calls were made."
     )
 
@@ -2091,7 +2096,7 @@ Retries go to `GET /retry/{orderId}` with `X-Deliverect-Version: retail`.
     if sample:
         with st.expander(f"IDs not returned ({not_returned:,})", expanded=False):
             st.dataframe(
-                [{"Order ID": oid} for oid in sample],
+                [{"Channel order display ID": oid} for oid in sample],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -2259,7 +2264,7 @@ def _render_retry_failed_job(job_id: str) -> None:
 def page_retry_failed_orders() -> None:
     st.title("Retry orders")
     st.caption(
-        "Paste order IDs or search by status, history, channel, and location. Dry run first."
+        "Paste channel order display IDs for this account and date, or search by status. Dry run first."
     )
     _render_retry_failed_orders(_get_account_id())
 

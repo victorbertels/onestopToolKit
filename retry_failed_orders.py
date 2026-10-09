@@ -35,7 +35,7 @@ API_BASE = "https://api.deliverect.io"
 RETRY_BASE = f"{API_BASE}/retry"
 
 # Bump when Cloud mounts look stale — Streamlit UI shows this version.
-MODULE_VERSION = "2026-10-09-retry-filters"
+MODULE_VERSION = "2026-10-09-retry-display-id"
 
 # Deliverect failed-order statuses for retail retry.
 FAILED_STATUSES = [120, 122]
@@ -68,6 +68,7 @@ ORDER_LIST_PROJECTION = {
     "_id": 1,
     "status": 1,
     "statusHistory": 1,
+    "channelOrderDisplayId": 1,
 }
 ORDER_PREVIEW_PROJECTION = {
     "_id": 1,
@@ -397,9 +398,11 @@ def scan_failed_orders(
     skips Manual Retry (123). Pass ``[]`` to retry orders that were already
     manually retried.
 
-    Pasted ``order_ids`` are matched on this account, then status filters run
-    in-process so skip reasons stay accurate. Other searches push status
-    include/exclude into the API query.
+    Pasted channel order display IDs are matched on this account inside the
+    time window (``channelOrderDisplayId`` + ``_created``). Status filters then
+    run in-process so skip reasons stay accurate. Internal ``order_ids`` are
+    matched on ``_id`` the same way. Other searches push status include/exclude
+    into the API query.
     """
     since = (since or "").strip()
     until = (until or "").strip()
@@ -427,9 +430,13 @@ def scan_failed_orders(
             "Add an include status, an exclude status, order IDs, a location, "
             "a channel, or a channel order display ID."
         )
-    if (not since or not until) and not (wanted_ids or display_ids):
+    if display_ids and (not since or not until):
         raise ValueError(
-            "A time window is required unless you pass order IDs or channel order display IDs."
+            "A time window is required to look up channel order display IDs on the account."
+        )
+    if (not since or not until) and not wanted_ids:
+        raise ValueError(
+            "A time window is required unless you pass internal order IDs."
         )
     if bool(since) != bool(until):
         raise ValueError("Provide both since and until, or neither.")
@@ -439,7 +446,7 @@ def scan_failed_orders(
             progress_callback(msg)
 
     # ID lookups apply status client-side so "excluded status" is countable.
-    apply_status = not wanted_ids
+    apply_status = not (wanted_ids or display_ids)
     wheres = _wheres_for_scan(
         account,
         since=since,
@@ -466,6 +473,7 @@ def scan_failed_orders(
 
     ids: list[str] = []
     seen: set[str] = set()
+    seen_display: set[str] = set()
     skipped_status = 0
     skipped_history = 0
     skipped_require = 0
@@ -480,6 +488,9 @@ def scan_failed_orders(
             if not oid or oid in seen:
                 continue
             seen.add(oid)
+            display_id = str(item.get("channelOrderDisplayId") or "").strip()
+            if display_id:
+                seen_display.add(display_id)
             reason = _skip_reason(
                 item,
                 include_statuses=include_set,
@@ -530,7 +541,15 @@ def scan_failed_orders(
                     f"{skipped_status:,} skipped on status)"
                 )
 
-    not_returned = [oid for oid in wanted_ids if oid not in seen] if wanted_ids else []
+    if display_ids:
+        not_returned = [value for value in display_ids if value not in seen_display]
+        requested_count = len(display_ids)
+    elif wanted_ids:
+        not_returned = [oid for oid in wanted_ids if oid not in seen]
+        requested_count = len(wanted_ids)
+    else:
+        not_returned = []
+        requested_count = 0
     plan = {
         "accountId": account,
         "since": since,
@@ -542,7 +561,7 @@ def scan_failed_orders(
         "channels": channel_list,
         "locationIds": locations,
         "channelOrderDisplayIds": display_ids,
-        "requestedOrderIds": len(wanted_ids),
+        "requestedOrderIds": requested_count,
         "matchedTotal": api_total,
         "uniqueMatched": len(seen),
         "toRetry": len(ids),
@@ -1231,7 +1250,7 @@ def main() -> None:
         action="append",
         default=[],
         dest="channel_order_ids",
-        help="channelOrderDisplayId (repeatable, or comma-separated)",
+        help="channelOrderDisplayId, matched on the account for the date (repeatable, or comma-separated)",
     )
     parser.add_argument(
         "--dry-run",
@@ -1278,7 +1297,8 @@ def main() -> None:
 
     explicit_window = bool(since or until or args.days or (args.date or "").strip())
     specific_ids = bool(order_ids or display_ids)
-    if specific_ids and not explicit_window:
+    # Internal _id lookups can skip the date. Display IDs are always scoped to it.
+    if order_ids and not display_ids and not explicit_window:
         since, until = "", ""
     elif since and until:
         pass
